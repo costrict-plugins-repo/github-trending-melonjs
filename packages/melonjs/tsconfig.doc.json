@@ -1,0 +1,25 @@
+{
+	"$schema": "https://json.schemastore.org/tsconfig",
+	"extends": "tsconfig/base.json",
+	"compilerOptions": {
+		"allowJs": true,
+		"noEmit": true,
+		"skipLibCheck": true,
+		"paths": {
+			"melonjs": ["./src/index.ts"]
+		}
+	},
+	"include": [
+		"src",
+		"scripts/docs/api-entry.ts",
+		"../capacitor-plugin/src",
+		"../debug-plugin/src",
+		"../gamepad-plugin/src",
+		"../matter-adapter/src",
+		"../planck-adapter/src",
+		"../rapier2d-adapter/src",
+		"../rapier3d-adapter/src",
+		"../spine-plugin/src",
+		"../tiled-inflate-plugin/src"
+	]
+}

@@ -1,0 +1,1940 @@
+import * as Matter from "matter-js";
+// @ts-expect-error — poly-decomp has no published types; only used to
+// register a global decomposer with matter-js below.
+import * as decomp from "poly-decomp";
+
+// Matter.js calls `decomp` internally via `Common.setDecomp(...)` to
+// break concave polygons (common in Tiled collision groups) into convex
+// pieces. Registering it once up-front saves users from having to wire
+// the global themselves.
+Matter.Common.setDecomp(decomp);
+
+import {
+	type AdapterCapabilities,
+	type BodyDefinition,
+	type BodyShape,
+	type Bounds,
+	Ellipse,
+	Line,
+	version as melonjsVersion,
+	type PhysicsAdapter,
+	type PhysicsBody,
+	Polygon,
+	type RaycastHit,
+	Rect,
+	type Renderable,
+	state,
+	utils,
+	Vector2d,
+	type World,
+} from "melonjs";
+
+declare const __VERSION__: string;
+
+/**
+ * Minimum melonJS version this adapter requires: the lower bound of its
+ * `melonjs` peer dependency range, so the two cannot disagree.
+ * @hidden
+ */
+export const REQUIRED_MELONJS_VERSION = "20.0.0";
+
+/**
+ * A pair whose start or active hooks are running. When one of them takes a
+ * body of the pair out, the pair's end is told in the order a hook can rely
+ * on: to the side going out at once, while it is whole, and to the other once
+ * the hooks are done; and only to a side that heard the start.
+ */
+interface Dispatch {
+	pair: Matter.Pair;
+	rA: Renderable;
+	rB: Renderable;
+	/** the pair's normal and depth when the hooks began, for a later end */
+	normal: { x: number; y: number };
+	depth: number;
+	/** the shapes the two parts were built from, kept for a later end */
+	entryA: ShapeEntry | undefined;
+	entryB: ShapeEntry | undefined;
+	/** the sides that may hear the end: those the start reached */
+	reached: number;
+	/** the sides already told the end */
+	told: number;
+	/** true once a body of the pair was taken out */
+	ended: boolean;
+}
+
+/** The melonJS shape a part was built from, and its index in the body. */
+type ShapeEntry = { shape: BodyShape; index: number };
+
+/** Which hooks of a pair a dispatch reaches: one bit per side and level. */
+const SIDE_A = 1;
+const SIDE_B = 2;
+const SHAPE_A = 4;
+const SHAPE_B = 8;
+const EVERY_SIDE = SIDE_A | SIDE_B | SHAPE_A | SHAPE_B;
+
+/**
+ * Options accepted by the {@link MatterAdapter} constructor.
+ */
+export interface MatterAdapterOptions {
+	/** initial world gravity, default `{x: 0, y: 1}` (matter-js convention) */
+	gravity?: { x: number; y: number };
+	/**
+	 * Number of physics substeps per engine frame. Each call to
+	 * {@link MatterAdapter.step} runs `Engine.update(engine, dt / N)`
+	 * `N` times instead of one full-dt step. Increases narrow-phase
+	 * accuracy at high relative velocities (break shots, projectiles)
+	 * at the cost of ~N× physics CPU. Default `1` matches the legacy
+	 * single-step behaviour. Values < 1 are clamped to 1.
+	 */
+	subSteps?: number;
+	/**
+	 * raw matter-js engine options forwarded to `Matter.Engine.create()`.
+	 * Use this to tweak solver iterations, constraint accuracy, etc.
+	 */
+	matterEngineOptions?: Matter.IEngineDefinition;
+}
+
+/**
+ * How thick a `Line` is simulated as, in pixels.
+ *
+ * matter has no segment primitive, so a zero-area outline cannot be built
+ * into a body at all: `Bodies.fromVertices` rejects the degenerate hull and
+ * the adapter used to fall back to the line's AXIS-ALIGNED BOUNDING BOX. For
+ * anything but a horizontal or vertical line that is a solid block rather
+ * than a surface, so a diagonal became a filled triangle-shaped wall and a
+ * body rested on the top of its bounding rectangle instead of on the slope.
+ *
+ * A thin oriented rectangle is the honest approximation: it follows the
+ * segment, it is convex, and matter simulates it exactly like any other box.
+ */
+const LINE_THICKNESS = 2;
+
+/**
+ * How far UP a contact normal must point for {@link MatterAdapter.isGrounded}
+ * to count the contact as ground: the upward component of the unit normal
+ * the body is pushed along. `0.1` accepts any surface up to about 84 degrees
+ * from horizontal, so slopes stay ground, and rejects a vertical wall with a
+ * margin for float noise and a body turned by a few degrees.
+ */
+const GROUND_NORMAL_Y = 0.1;
+
+/**
+ * The message for a shape this adapter cannot build a fixture from.
+ *
+ * Worth more than the shape's name. Both refusals are deliberate rather than
+ * oversights, and what the caller has to do about them differs: a 3D shape is
+ * a backend choice, a `Point` is a modelling one. The old message named the
+ * shape and stopped, which left the reader to work out whether they had hit a
+ * bug, a gap, or a rule.
+ * @param adapter - the adapter's name, for the prefix
+ * @param shape - the shape that was refused
+ * @returns the message to throw
+ */
+function unsupportedShapeMessage(adapter: string, shape: BodyShape): string {
+	// `type` rather than `constructor.name`: the class name is mangled by a
+	// minifier and this string is most useful in a production build.
+	const name =
+		(shape as { type?: string }).type ??
+		(shape as { constructor: { name: string } }).constructor.name;
+	const prefix = `${adapter}: unsupported shape type ${name}.`;
+	if (name === "Box3d" || name === "Sphere") {
+		return `${prefix} Box3d and Sphere carry a depth extent, and a 2D solver has no depth to resolve it against, so they are resolved only by the builtin adapter. Either give this body the planar shape with the same footprint (an Ellipse for a Sphere, a Rect for a Box3d), or leave it on the builtin adapter.`;
+	}
+	if (name === "Point") {
+		return `${prefix} A Point has no area to build a fixture from. Use a small Rect or Ellipse instead, with isSensor set if it is only meant to report contacts.`;
+	}
+	return `${prefix} This adapter builds fixtures from Rect, RoundRect, Polygon, Line and Ellipse.`;
+}
+
+/**
+ * melonJS physics adapter wrapping matter-js (https://brm.io/matter-js/).
+ *
+ * Implements the full {@link PhysicsAdapter} interface so the same game
+ * code that runs on the built-in SAT physics also runs under Matter —
+ * with the upgrade in capabilities Matter brings (real rotational
+ * dynamics, restitution-based stacking, sleeping bodies, native raycasts).
+ * melonJS's shared joints (`world.addJoint()`) are not supported here: they
+ * need the planck or Rapier adapter. matter's own constraints are reached
+ * through {@link MatterAdapter.matter}.
+ * @example
+ * import { Application } from "melonjs";
+ * import { MatterAdapter } from "@melonjs/matter-adapter";
+ *
+ * const app = new Application(800, 600, {
+ *     parent: "screen",
+ *     physic: new MatterAdapter(),
+ * });
+ * @category Plugins
+ * @document ../README.md
+ */
+export class MatterAdapter implements PhysicsAdapter {
+	readonly physicLabel = "matter";
+	readonly name = "@melonjs/matter-adapter";
+	readonly version = __VERSION__;
+	readonly url = "https://www.npmjs.com/package/@melonjs/matter-adapter";
+
+	readonly capabilities: AdapterCapabilities = {
+		// melonJS's shared joints (`world.addJoint()`) are not supported;
+		// matter's own constraints are reached through `adapter.matter`
+		constraints: false,
+		// matter-js steps discretely: a fast body can pass through a thin
+		// one. `subSteps` is the remedy, not a capability to branch on.
+		continuousCollisionDetection: false,
+		sleepingBodies: true,
+		raycasts: true,
+		// Matter.js is 2D-only; no `raycast3d` method. User code under
+		// Camera3d should run on the builtin adapter (or a future 3D
+		// adapter) if it needs `world.adapter.raycast3d?(...)`.
+		raycasts3d: false,
+		velocityLimit: true,
+		isGrounded: true,
+	};
+
+	gravity: Vector2d;
+
+	/**
+	 * Raw matter-js namespace — escape hatch for matter-specific features
+	 * the portable `PhysicsAdapter` interface doesn't cover (constraints,
+	 * compound bodies, events on the Matter engine, queries, etc.).
+	 *
+	 * Saves you from adding a transitive `import * as Matter from "matter-js"`
+	 * just to reach the factories you need. The Matter modules are accessed
+	 * by the same names matter's own docs use, so examples from the
+	 * matter-js docs copy-paste without renaming:
+	 *
+	 * ```ts
+	 * const spring = adapter.matter.Constraint.create({
+	 *   bodyA: a.body, bodyB: b.body, stiffness: 0.04, length: 80,
+	 * });
+	 * adapter.matter.Composite.add(adapter.engine.world, spring);
+	 * ```
+	 *
+	 * Game code that touches `adapter.matter.*` is matter-only — it will
+	 * not work under any other physics adapter. Use the
+	 * `PhysicsAdapter` methods for anything that should stay portable.
+	 * @see {@link https://brm.io/matter-js/docs/ Official matter-js documentation}
+	 * for the full module reference (`Matter.Constraint`, `Matter.Composite`,
+	 * `Matter.Bodies`, `Matter.Events`, `Matter.Query`, `Matter.Vector`, …).
+	 */
+	readonly matter: typeof Matter = Matter;
+
+	/** the underlying Matter engine; exposed for advanced use cases. */
+	engine!: Matter.Engine;
+
+	/** back-reference to the owning melonJS world (set in {@link init}). */
+	world!: World;
+
+	/** renderable → its matter-js body */
+	private readonly bodyMap = new Map<Renderable, Matter.Body>();
+	/** matter-js body → its renderable (for collision / sync) */
+	private readonly renderableMap = new Map<Matter.Body, Renderable>();
+	/**
+	 * matter part -> the melonJS shape it was built from, plus that shape's
+	 * index in the body definition.
+	 *
+	 * matter reports collisions between PARTS, so this is what lets a contact
+	 * name the shapes involved rather than only the bodies (melonjs#1596). A
+	 * single-shape body IS its own part, so both cases are covered uniformly.
+	 */
+	private readonly partShapeMap = new Map<
+		Matter.Body,
+		{ shape: BodyShape; index: number }
+	>();
+	/** per-body velocity cap (Matter has no native equivalent) */
+	private readonly velocityLimits = new Map<
+		Renderable,
+		{ x: number; y: number }
+	>();
+	/**
+	 * Caps set before the renderable had a body, applied when `addBody`
+	 * builds one. Held weakly: a renderable never added is not kept alive.
+	 */
+	private pendingLimits = new WeakMap<Renderable, { x: number; y: number }>();
+	/** the ids of touching pairs, from their start hooks until their end */
+	private readonly started = new Set<string>();
+	/** the pairs whose start or active hooks are running, innermost last */
+	private readonly dispatching: Dispatch[] = [];
+	/** per-body bodyDef hash kept for shape introspection / removeBody */
+	private readonly defMap = new Map<Renderable, BodyDefinition>();
+	/**
+	 * Per-body gravity multiplier. matter-js 0.20 doesn't honor a
+	 * body-level gravityScale, so we emulate it by applying a counter-
+	 * force each step (see {@link init} `beforeUpdate`). Only stored for
+	 * bodies with scale ≠ 1; the default-1 case is the hot path and we
+	 * skip the map lookup entirely for it.
+	 */
+	private readonly bodyGravityScale = new Map<Matter.Body, number>();
+	/**
+	 * Offset between `renderable.pos` (top-left in melonJS convention)
+	 * and `Matter.Body.position` (centroid in Matter's convention). Stored
+	 * at addBody time so syncFromPhysics can place the sprite correctly.
+	 */
+	private readonly posOffsets = new Map<Renderable, { x: number; y: number }>();
+
+	/**
+	 * Shapes handed back by {@link MatterAdapter#getBodyShapes}: one reusable
+	 * array per renderable whose members are refreshed in place, so a spinning
+	 * body costs no allocation on the debug overlay's per-frame path. Dropped
+	 * in `removeBody`, so nothing outlives the body it describes.
+	 */
+	private readonly reportedShapes = new Map<Renderable, BodyShape[]>();
+
+	private readonly matterOptions: Matter.IEngineDefinition | undefined;
+
+	private readonly subSteps: number;
+
+	/**
+	 * Resolves once the adapter can be constructed. matter-js is plain JavaScript, loaded with this package, so this resolves
+	 * at once; it is here so every adapter has the same
+	 * {@link PhysicsAdapterClass} API, and code written as
+	 * `await MatterAdapter.create()` reads the same as for one that loads
+	 * WebAssembly first.
+	 * @returns a resolved promise
+	 */
+	static load(): Promise<void> {
+		return Promise.resolve();
+	}
+
+	/**
+	 * Create an adapter, the same way for every adapter: wait for
+	 * {@link MatterAdapter.load}, then construct it. Here that is the same as
+	 * `new MatterAdapter(options)`, which stays supported.
+	 * @param options - the constructor's options
+	 * @returns the new adapter, an instance of the class `create` is called on
+	 * @example
+	 * const app = new Application(800, 600, {
+	 *     physic: await MatterAdapter.create(),
+	 * });
+	 */
+	static async create<T extends PhysicsAdapter>(
+		// the shape of `PhysicsAdapterClass`, spelled out so this package
+		// still type-checks against a melonJS older than the one defining it
+		this: Pick<typeof MatterAdapter, "load"> &
+			(new (
+				options?: MatterAdapterOptions,
+			) => T),
+		options?: MatterAdapterOptions,
+	): Promise<T> {
+		await this.load();
+		return new this(options);
+	}
+
+	constructor(options: MatterAdapterOptions = {}) {
+		// Mirror the BasePlugin version-check pattern: refuse to construct
+		// against a melonJS that's too old to support the PhysicsAdapter
+		// surface this adapter expects. Throwing here is loud and early —
+		// the error names the required version so users know what to upgrade.
+		if (utils.checkVersion(REQUIRED_MELONJS_VERSION, melonjsVersion) > 0) {
+			throw new Error(
+				`@melonjs/matter-adapter requires melonJS >= ${REQUIRED_MELONJS_VERSION}, ` +
+					`but the loaded melonJS is ${melonjsVersion}.`,
+			);
+		}
+		this.matterOptions = options.matterEngineOptions;
+		this.subSteps = Math.max(1, Math.floor(options.subSteps ?? 1));
+		// Default to matter-js native gravity: `(0, 1)` with the internal
+		// `gravity.scale = 0.001`. This is intentionally NOT tuned to
+		// match BuiltinAdapter's per-frame integration feel — the whole
+		// point of running on Matter is to get Matter's real-physics
+		// feel. Game code that wants legacy-style "fast arcade gravity"
+		// should bump these values explicitly via the constructor option.
+		const g = options.gravity ?? { x: 0, y: 1 };
+		this.gravity = new Vector2d(g.x, g.y);
+	}
+
+	/**
+	 * Stored references to the listeners registered in {@link init}, so
+	 * {@link destroy} can `Matter.Events.off` them. Without these stored
+	 * refs, a destroy/re-init cycle would leak the old listeners and
+	 * dispatch every event twice on the second cycle.
+	 */
+	private _matterListeners: Array<{
+		name: string;
+		fn: (e: unknown) => void;
+	}> = [];
+
+	init(world: World): void {
+		this.world = world;
+		this.engine = Matter.Engine.create(this.matterOptions);
+		// reflect our gravity vector onto the Matter engine
+		this.engine.gravity.x = this.gravity.x;
+		this.engine.gravity.y = this.gravity.y;
+		// matter-js's internal `gravity.scale` defaults to 0.001 — left
+		// untouched so this adapter behaves like a vanilla matter-js
+		// engine. Game code that wants stronger gravity should pass a
+		// larger `options.gravity` value, or mutate `adapter.gravity`
+		// after construction.
+		const on = (name: string, fn: (e: unknown) => void) => {
+			Matter.Events.on(
+				this.engine,
+				name,
+				fn as Parameters<typeof Matter.Events.on>[2],
+			);
+			this._matterListeners.push({ name, fn });
+		};
+		// Emulate per-body gravityScale: matter-js 0.20 only honors the
+		// engine-level `gravity.scale`, so we add a counter-force to each
+		// non-default-scale body before integration. Net effect after
+		// matter's own gravity step = mass * gravity * scale * gravityScale.
+		on("beforeUpdate", () => {
+			if (this.bodyGravityScale.size === 0) return;
+			const gx = this.engine.gravity.x;
+			const gy = this.engine.gravity.y;
+			const gs = (this.engine.gravity as { scale?: number }).scale ?? 0.001;
+			for (const [body, scale] of this.bodyGravityScale) {
+				if (body.isStatic || body.isSleeping) continue;
+				const k = (scale - 1) * body.mass * gs;
+				body.force.x += k * gx;
+				body.force.y += k * gy;
+			}
+		});
+		// after each step, clamp velocities to maxVelocity (Matter has no
+		// native cap) and copy positions back to the renderables
+		on("afterUpdate", () => {
+			this._clampVelocities();
+			this.syncFromPhysics();
+		});
+		// Route matter's three collision events to the renderable hooks.
+		// `onCollision` is the legacy alias — same firing as `onCollisionStart`
+		// (one-shot when contact begins). For frame-by-frame "still in contact"
+		// semantics use `onCollisionActive`; for "contact just broke" use
+		// `onCollisionEnd`.
+		on("collisionStart", (e) => {
+			this._dispatchCollisions((e as { pairs: Matter.Pair[] }).pairs, "start");
+		});
+		on("collisionActive", (e) => {
+			this._dispatchCollisions((e as { pairs: Matter.Pair[] }).pairs, "active");
+		});
+		on("collisionEnd", (e) => {
+			this._dispatchCollisions((e as { pairs: Matter.Pair[] }).pairs, "end");
+		});
+	}
+
+	destroy(): void {
+		// Unregister listeners first so any matter events fired during the
+		// teardown don't re-enter our dispatchers with already-cleared state.
+		for (const { name, fn } of this._matterListeners) {
+			Matter.Events.off(
+				this.engine,
+				name,
+				fn as Parameters<typeof Matter.Events.off>[2],
+			);
+		}
+		this._matterListeners = [];
+		Matter.Composite.clear(this.engine.world, false, true);
+		Matter.Engine.clear(this.engine);
+		this.bodyMap.clear();
+		this.renderableMap.clear();
+		this.partShapeMap.clear();
+		this.started.clear();
+		this.dispatching.length = 0;
+		this.velocityLimits.clear();
+		this.pendingLimits = new WeakMap();
+		this.defMap.clear();
+		this.bodyGravityScale.clear();
+		this.posOffsets.clear();
+		this.reportedShapes.clear();
+	}
+
+	step(dt: number): void {
+		// Mirror BuiltinAdapter's pause behavior: when the engine is
+		// paused (browser loses focus, state.pause(), etc.) skip the
+		// physics step entirely. Matter has no per-body pause control,
+		// so we pause the whole simulation rather than individual bodies
+		// — bodies with `updateWhenPaused = true` are not preserved here,
+		// which is a documented difference from BuiltinAdapter.
+		if (state.isPaused()) {
+			return;
+		}
+		// a step of no length simulates nothing, and one that is not a
+		// number would turn every body it touched into NaN for good
+		if (!(dt > 0) || !Number.isFinite(dt)) {
+			return;
+		}
+		// mirror gravity (user may have mutated this.gravity since init)
+		this.engine.gravity.x = this.gravity.x;
+		this.engine.gravity.y = this.gravity.y;
+		// matter-js takes delta in ms — exactly what World.update passes.
+		// Substepping: run N engine ticks of `dt/N` instead of one of `dt`.
+		// The narrow phase is discrete (no swept tests), so a body moving
+		// faster than ~1 radius per tick can tunnel through another body
+		// or a thin wall. Smaller per-tick deltas keep the inter-body
+		// motion under that threshold; default `subSteps=1` reproduces
+		// the previous single-step behaviour exactly.
+		if (this.subSteps === 1) {
+			Matter.Engine.update(this.engine, dt);
+		} else {
+			const sub = dt / this.subSteps;
+			for (let i = 0; i < this.subSteps; i++) {
+				Matter.Engine.update(this.engine, sub);
+			}
+		}
+	}
+
+	syncFromPhysics(): void {
+		for (const [body, renderable] of this.renderableMap) {
+			// Renderables can be destroyed mid-step (level reset, pool
+			// recycle, removeChild) — their pooled `pos` vector gets
+			// released and becomes undefined, but the body may still be
+			// in matter's engine for one more frame. Skip those instead
+			// of crashing; the body will be unregistered shortly.
+			// eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- runtime guard: pos is typed non-null but the pool releases it on recycle
+			if (!renderable.pos) {
+				continue;
+			}
+			// melonJS renderable.pos is top-left (anchor 0,0 default);
+			// Matter body.position is the centroid. Apply the stored
+			// offset to translate back into renderable space.
+			const off = this.posOffsets.get(renderable);
+			if (off) {
+				renderable.pos.x = body.position.x + off.x;
+				renderable.pos.y = body.position.y + off.y;
+			} else {
+				renderable.pos.x = body.position.x;
+				renderable.pos.y = body.position.y;
+			}
+			// Mirror body angle onto the renderable's transform. melonJS
+			// renderables expose `currentTransform` as a Matrix3d.
+			// `Renderable.preDraw` applies the transform with the pivot at
+			// `renderable.pos`, but matter rotates the body around its
+			// centroid. For renderables whose `pos` is the top-left
+			// (anchor 0,0) with a body shape centered inside the bounds,
+			// the two pivots differ by `-posOffset` — rotating around
+			// `pos` would spin the sprite around its corner. Pre-translate
+			// by the centroid-relative offset so the rotation lands on
+			// the visible center regardless of anchor.
+			const t = renderable.currentTransform;
+			const off2 = this.posOffsets.get(renderable);
+			const cx = off2 ? -off2.x : 0;
+			const cy = off2 ? -off2.y : 0;
+			t.identity();
+			if (cx !== 0 || cy !== 0) {
+				t.translate(cx, cy);
+				t.rotate(body.angle);
+				t.translate(-cx, -cy);
+			} else {
+				t.rotate(body.angle);
+			}
+		}
+	}
+
+	addBody(renderable: Renderable, def: BodyDefinition): MatterAdapter.Body {
+		// translate shapes into matter bodies. Multi-shape defs become a
+		// matter compound body (Matter.Body.create with parts).
+		// The frame the renderable DRAWS in. `anchorPoint` shifts a
+		// renderable's bounds by `-size * anchorPoint` and `preDraw` shifts
+		// its pixels by the same amount, and collision shapes are authored in
+		// that same frame, so the body is built there rather than on `pos`.
+		// Zero for an anchor of (0, 0) — what `Entity` and Tiled objects set —
+		// so those paths are unchanged. Zero too when the renderable opts out
+		// of the anchor entirely via `applyAnchorTransform === false`, the
+		// flag `preDraw` itself reads: a `GLTFModel`, and a `Mesh` on the
+		// `Camera3d` world-space path, place themselves by their own transform
+		// and draw at `pos` with no anchor shift, so taking one off here would
+		// build the body half a bounds box away from the model. Guarded on
+		// `Number.isFinite` as `preDraw` is: a `Container`'s default size is
+		// `Infinity`, and `Infinity * 0` is `NaN`.
+		const anchored = renderable.applyAnchorTransform;
+		const anchorX =
+			anchored && Number.isFinite(renderable.width)
+				? renderable.width * renderable.anchorPoint.x
+				: 0;
+		const anchorY =
+			anchored && Number.isFinite(renderable.height)
+				? renderable.height * renderable.anchorPoint.y
+				: 0;
+		const baseX = renderable.pos.x - anchorX;
+		const baseY = renderable.pos.y - anchorY;
+		// `isActive === false` keeps a shape out of the simulation without
+		// removing it from the definition — the portable flag the builtin and
+		// the planck adapter both honour. Skipped here rather than created and
+		// disabled, so the same body collides the same way on every backend.
+		// The index carried into `partShapeMap` is the shape's index in the
+		// ORIGINAL list, so collision events still name the right shape.
+		const parts: Matter.Body[] = [];
+		const origins: { shape: BodyShape; index: number }[] = [];
+		def.shapes.forEach((s, i) => {
+			if ((s as { isActive?: boolean }).isActive === false) {
+				return;
+			}
+			parts.push(this._shapeToMatter(s, baseX, baseY));
+			origins.push({ shape: s, index: i });
+		});
+		// every part is built, so a refused shape has left nothing behind;
+		// a renderable has one body: a second one replaces the first
+		this.removeBody(renderable);
+		parts.forEach((part, i) => {
+			this.partShapeMap.set(part, origins[i]);
+		});
+		if (parts.length === 0) {
+			// every shape disabled: matter cannot build a body from nothing, so
+			// keep one inert part rather than throwing — the body still exists
+			// for the caller to re-enable a shape on later via `updateShape`
+			parts.push(
+				Matter.Bodies.rectangle(baseX, baseY, 1, 1, { isSensor: true }),
+			);
+		}
+		let body: Matter.Body;
+		if (parts.length === 1) {
+			body = parts[0];
+		} else {
+			body = Matter.Body.create({ parts });
+		}
+
+		// apply portable BodyDefinition fields onto the matter body
+		if (def.type === "static") {
+			Matter.Body.setStatic(body, true);
+		}
+		if (typeof def.density === "number") {
+			Matter.Body.setDensity(body, def.density);
+		}
+		if (def.frictionAir !== undefined) {
+			// Matter only supports scalar frictionAir; melonJS defs can be
+			// {x, y} — average the two so the simulation feels close even
+			// when the user passes per-axis values (rare).
+			body.frictionAir =
+				typeof def.frictionAir === "number"
+					? def.frictionAir
+					: (def.frictionAir.x + def.frictionAir.y) / 2;
+		}
+		if (typeof def.restitution === "number") {
+			body.restitution = def.restitution;
+		}
+		if (typeof def.friction === "number") {
+			body.friction = def.friction;
+		}
+		if (typeof def.gravityScale === "number" && def.gravityScale !== 1) {
+			// matter-js 0.20 has no per-body gravityScale — store it and
+			// apply a counter-force each step in the beforeUpdate handler.
+			this.bodyGravityScale.set(body, def.gravityScale);
+		}
+		// Install live getter/setter aliases so the matter-native form
+		// (`body.collisionFilter.category` / `body.collisionFilter.mask`)
+		// and the legacy melonJS form (`body.collisionType` /
+		// `body.collisionMask`) read and write the same underlying state.
+		// Either API works; matter users don't have to learn melonJS's
+		// names, and legacy melonJS handlers don't have to know about
+		// collisionFilter.
+		Object.defineProperties(body, {
+			collisionType: {
+				get(this: Matter.Body) {
+					return this.collisionFilter.category;
+				},
+				set(this: Matter.Body, v: number) {
+					this.collisionFilter.category = v;
+				},
+				configurable: true,
+				enumerable: true,
+			},
+			collisionMask: {
+				get(this: Matter.Body) {
+					return this.collisionFilter.mask;
+				},
+				set(this: Matter.Body, v: number) {
+					this.collisionFilter.mask = v;
+				},
+				configurable: true,
+				enumerable: true,
+			},
+		});
+		if (typeof def.collisionType === "number") {
+			body.collisionFilter.category = def.collisionType;
+		}
+		if (typeof def.collisionMask === "number") {
+			body.collisionFilter.mask = def.collisionMask;
+		}
+		if (def.isSensor) {
+			// on every part: matter's pairs are per PART and read the flag
+			// from the part, so a compound body flagged only on its parent
+			// stayed solid
+			this._setSensor(body, true);
+		}
+		// Only when asked. Matter computes a finite inertia from the body's
+		// vertices, so a body rotates by default, and an adapter that locks
+		// rotation unless told otherwise inverts the engine it wraps: a rigid
+		// body would sit on a corner instead of toppling, and `setAngle` would
+		// still work, so the body could look rotated while being unable to
+		// rotate. A game that needs bodies to stay axis-aligned asks for it.
+		if (def.fixedRotation === true) {
+			Matter.Body.setInertia(body, Number.POSITIVE_INFINITY);
+		}
+
+		Matter.Composite.add(this.engine.world, body);
+		this.bodyMap.set(renderable, body);
+		this.renderableMap.set(body, renderable);
+		this.defMap.set(renderable, def);
+		// the definition's cap, or else one set before the body was built
+		const limit = def.maxVelocity ?? this.pendingLimits.get(renderable);
+		this.pendingLimits.delete(renderable);
+		if (limit) {
+			this.setMaxVelocity(renderable, limit);
+		}
+		// Track the offset between renderable.pos (top-left) and the
+		// matter body's centroid so syncFromPhysics places the sprite
+		// correctly.
+		// Deliberately `renderable.pos`, not `baseX`/`baseY`: this offset
+		// puts the SPRITE back where it belongs on the way out of the
+		// simulation, and the sprite is placed from `pos`. Using the
+		// anchor-shifted origin here would feed the offset back in twice and
+		// walk the renderable away from the body every step.
+		this.posOffsets.set(renderable, {
+			x: renderable.pos.x - body.position.x,
+			y: renderable.pos.y - body.position.y,
+		});
+		// Debug-plugin compatibility is provided via the adapter-side
+		// `getBodyAABB` / `getBodyShapes` methods (see below). No
+		// foreign methods are attached to the matter Body itself — it
+		// stays a pure `Matter.Body`, with adapter-owned coordinate-
+		// system translation living on the adapter where it belongs.
+		// melonJS Body convention: attach legacy-shaped helper methods so
+		// `renderable.body.setVelocity(x, y)` / `applyForce(x, y)` etc.
+		// work identically under either adapter. The body is still a real
+		// `Matter.Body` — these are additive convenience methods that
+		// delegate to matter's free functions. Users who want raw matter
+		// access can keep calling `Matter.Body.setVelocity(body, v)`.
+		//
+		// `helpers` is typed as the portable {@link PhysicsBody} interface
+		// (minus the `collisionType`/`collisionMask` data fields, which
+		// are installed as live getter/setter aliases on the body itself
+		// just below). If a method is added to or removed from PhysicsBody
+		// in melonJS, this object fails to type-check until updated —
+		// keeps the matter helpers in lockstep with the portable contract.
+		// a write through the handle wakes a sleeping body, as the adapter's
+		// own methods do
+		const wake = () => {
+			this.wake(body);
+		};
+		const helpers: Omit<PhysicsBody, "collisionType" | "collisionMask"> = {
+			setVelocity(x: number, y: number) {
+				wake();
+				Matter.Body.setVelocity(body, { x, y });
+			},
+			getVelocity(out?: Vector2d): Vector2d {
+				return (out ?? new Vector2d()).set(body.velocity.x, body.velocity.y);
+			},
+			applyForce(x: number, y: number, pointX?: number, pointY?: number) {
+				// Matter's `applyForce` is inherently lever-arm-aware: a
+				// force applied at a point != centroid generates a torque
+				// automatically as part of matter's integration. Pass the
+				// point through when provided, otherwise default to the
+				// body's centroid (pure linear, matching the 2-arg call).
+				const point =
+					typeof pointX === "number" && typeof pointY === "number"
+						? { x: pointX, y: pointY }
+						: body.position;
+				wake();
+				Matter.Body.applyForce(body, point, { x, y });
+			},
+			applyImpulse(x: number, y: number) {
+				// matter has no applyImpulse — convert via dv = J / m
+				const invMass = body.mass > 0 ? 1 / body.mass : 0;
+				wake();
+				Matter.Body.setVelocity(body, {
+					x: body.velocity.x + x * invMass,
+					y: body.velocity.y + y * invMass,
+				});
+			},
+			setSensor: (isSensor = true) => {
+				this._setSensor(body, isSensor);
+			},
+			setStatic(isStatic = true) {
+				Matter.Body.setStatic(body, isStatic);
+			},
+			setCollisionMask(mask: number) {
+				// `body.collisionMask` is a live alias of
+				// `body.collisionFilter.mask` (see the property descriptor
+				// installed below), so writing either form propagates.
+				body.collisionFilter.mask = mask;
+			},
+			setCollisionType(type: number) {
+				body.collisionFilter.category = type;
+			},
+			setMass: (m: number) => {
+				Matter.Body.setMass(body, m);
+			},
+			setBounce(r: number) {
+				// matter's body property is `restitution`; expose `setBounce`
+				// to match the legacy melonJS API while writing the
+				// matter-native field.
+				body.restitution = r;
+			},
+			setGravityScale: (scale: number) => {
+				// matter-js 0.20 has no native per-body gravity scale —
+				// the adapter emulates it via `bodyGravityScale` map +
+				// per-frame counter-force. Update the map directly here.
+				if (scale === 1) {
+					this.bodyGravityScale.delete(body);
+				} else {
+					this.bodyGravityScale.set(body, scale);
+				}
+			},
+			setAngularVelocity(omega: number) {
+				wake();
+				Matter.Body.setAngularVelocity(body, omega);
+			},
+			getAngularVelocity(): number {
+				return body.angularVelocity;
+			},
+			setAngle(rad: number) {
+				wake();
+				Matter.Body.setAngle(body, rad);
+			},
+			getAngle(): number {
+				return body.angle;
+			},
+			applyTorque(t: number) {
+				// matter-js accumulates `body.torque` for the next step;
+				// adding to it is the documented way to apply an angular
+				// impulse without going through the force/lever-arm path.
+				wake();
+				body.torque += t;
+			},
+		};
+		Object.assign(body, helpers);
+		// After Object.assign the runtime body satisfies both the
+		// matter-js `Body` interface AND the portable `PhysicsBody`
+		// (plus the live `collisionType` / `collisionMask` aliases
+		// installed via Object.defineProperties above). TypeScript can't
+		// see the spliced helpers, so cast explicitly — this is the one
+		// spot where the adapter promises the body conforms to its
+		// published `MatterAdapter.Body` type.
+		const adapterBody = body as MatterAdapter.Body;
+		// Convention: `renderable.body` is the adapter's body handle.
+		// Stored as the portable `PhysicsBody` on the Renderable; matter-
+		// specific code casts to `MatterAdapter.Body` to reach native
+		// fields (frictionAir, angle, …).
+		renderable.body = adapterBody;
+		// as the builtin `Body` constructor does: a renderable with a body
+		// takes part in physics and receives pointer events
+		renderable.isKinematic = false;
+		return adapterBody;
+	}
+
+	removeBody(renderable: Renderable): void {
+		const body = this.bodyMap.get(renderable);
+		if (body) {
+			// a partner still touching this body learns the contact ended, as
+			// on the other adapters: matter only reports the end of a pair
+			// whose bodies it still holds
+			this._endContacts(renderable);
+			// one of their hooks may have taken this body out already
+			if (this.bodyMap.get(renderable) !== body) {
+				return;
+			}
+			Matter.Composite.remove(this.engine.world, body);
+			for (const part of body.parts) {
+				this.partShapeMap.delete(part);
+			}
+			this.bodyMap.delete(renderable);
+			this.renderableMap.delete(body);
+			this.velocityLimits.delete(renderable);
+			this.defMap.delete(renderable);
+			this.posOffsets.delete(renderable);
+			// `updateShape` is a remove + add, so clearing here also stops a
+			// reshaped body reporting its previous geometry
+			this.reportedShapes.delete(renderable);
+			this.bodyGravityScale.delete(body);
+		}
+	}
+
+	/**
+	 * Not supported: melonJS's shared joints (`world.addJoint()`) need the
+	 * planck or Rapier adapter, so this always returns `null`
+	 * (`capabilities.constraints` is `false`), which makes `world.addJoint()`
+	 * throw. matter's own constraints are
+	 * still there, through {@link MatterAdapter.matter}.
+	 * @returns `null`
+	 */
+	addJoint(): null {
+		return null;
+	}
+
+	/**
+	 * Does nothing: see {@link MatterAdapter.addJoint}.
+	 */
+	removeJoint(): void {}
+
+	updateShape(renderable: Renderable, shapes: BodyShape[]): void {
+		// matter-js doesn't support live shape mutation cleanly — the
+		// pragmatic approach is to rebuild the body. Preserve the prior
+		// def, swap shapes, re-register — AND carry forward the velocity
+		// state (linear + angular) so a moving body whose shape changes
+		// mid-flight doesn't stop dead.
+		const oldDef = this.defMap.get(renderable);
+		if (!oldDef) {
+			return;
+		}
+		const oldBody = this.bodyMap.get(renderable);
+		const savedVel = oldBody
+			? { x: oldBody.velocity.x, y: oldBody.velocity.y }
+			: undefined;
+		const savedAngVel = oldBody?.angularVelocity ?? 0;
+		this.removeBody(renderable);
+		const newBody = this.addBody(renderable, { ...oldDef, shapes });
+		if (savedVel) {
+			Matter.Body.setVelocity(newBody, savedVel);
+			Matter.Body.setAngularVelocity(newBody, savedAngVel);
+		}
+	}
+
+	getVelocity(renderable: Renderable, out?: Vector2d): Vector2d {
+		const body = this.bodyMap.get(renderable);
+		const target = out ?? new Vector2d();
+		if (body) {
+			return target.set(body.velocity.x, body.velocity.y);
+		}
+		return target.set(0, 0);
+	}
+
+	setVelocity(renderable: Renderable, v: Vector2d): void {
+		const body = this.bodyMap.get(renderable);
+		if (body) {
+			this.wake(body);
+			Matter.Body.setVelocity(body, { x: v.x, y: v.y });
+		}
+	}
+
+	applyForce(renderable: Renderable, force: Vector2d, point?: Vector2d): void {
+		const body = this.bodyMap.get(renderable);
+		if (!body) return;
+		// True Newtonian force application — Matter integrates this as
+		// `force / mass * dt²` per step. Game code that wants the legacy
+		// "set velocity to this value each frame" pattern (what
+		// BuiltinAdapter's force-accumulator gave you under the hood)
+		// should use `setVelocity` instead.
+		this.wake(body);
+		Matter.Body.applyForce(body, point ?? body.position, {
+			x: force.x,
+			y: force.y,
+		});
+	}
+
+	applyImpulse(renderable: Renderable, impulse: Vector2d): void {
+		// Matter has no applyImpulse — convert via dv = J / m and update vel.
+		// (interface `point?` is accepted in the call site but matter has no
+		// off-center impulse equivalent, so we ignore it.)
+		const body = this.bodyMap.get(renderable);
+		if (!body) return;
+		const invMass = body.mass > 0 ? 1 / body.mass : 0;
+		this.wake(body);
+		Matter.Body.setVelocity(body, {
+			x: body.velocity.x + impulse.x * invMass,
+			y: body.velocity.y + impulse.y * invMass,
+		});
+	}
+
+	setPosition(renderable: Renderable, p: Vector2d): void {
+		const body = this.bodyMap.get(renderable);
+		if (body) {
+			// `p` is in renderable.pos space (typically top-left). Matter's
+			// body.position is the centroid — convert via the offset stored
+			// at addBody time so syncFromPhysics keeps renderable.pos at the
+			// requested value.
+			const off = this.posOffsets.get(renderable);
+			this.wake(body);
+			Matter.Body.setPosition(body, {
+				x: p.x - (off?.x ?? 0),
+				y: p.y - (off?.y ?? 0),
+			});
+			// Matter caches contact pairs across steps for solver continuity.
+			// After a discontinuous teleport the cached pair still holds the
+			// previous penetration depth + normal, and matter's Baumgarte
+			// position-correction phase applies that on the next step before
+			// narrow-phase invalidates the pair — yanking the body back
+			// toward the old contact point by ≈ penetration depth. Builtin
+			// and planck handle this natively (planck's `b2Body::SetTransform`
+			// documents "contacts are updated on the next call to
+			// b2World::Step"); matter doesn't, so do it ourselves.
+			this.invalidateContactsFor(body);
+		}
+		renderable.pos.x = p.x;
+		renderable.pos.y = p.y;
+	}
+
+	/**
+	 * Wake a sleeping body before a velocity, force, angle or position is
+	 * written to it. matter skips a sleeping body in its step, so a write to
+	 * one was dropped (a `setVelocity` on a crate at rest did nothing);
+	 * planck and Rapier wake the body themselves. Only reachable with
+	 * `matterEngineOptions.enableSleeping`.
+	 * @param body - the body about to be written to
+	 */
+	private wake(body: Matter.Body): void {
+		if (body.isSleeping) {
+			Matter.Sleeping.set(body, false);
+		}
+	}
+
+	private invalidateContactsFor(body: Matter.Body): void {
+		// Flush the per-body cached position-correction impulse so matter's
+		// position-warming mechanism doesn't reapply stale penetration
+		// data on the next step. Used by setPosition to keep a
+		// discontinuous teleport from being undone by the solver.
+		// Zero the per-body cached position-correction impulse. Matter's
+		// `Resolver.postSolvePosition` applies `body.positionImpulse` to
+		// the body every step via the position-warming mechanism (for
+		// solver continuity across frames), independently of whether
+		// `pairs.list` still has an active contact. After a discontinuous
+		// teleport that cached impulse contains the OLD penetration
+		// vector, and reapplying it yanks the body back toward the old
+		// contact point by ≈ penetration depth. Zeroing it disables the
+		// warming for one frame — matter will rebuild a fresh impulse
+		// from genuine contacts on the next step if any exist.
+		// Note: engine.pairs is left alone deliberately so matter's
+		// natural pair-lifecycle (Pairs.update marking the stale pair
+		// as inactive on the next step, then moving it to collisionEnd
+		// and firing the event) still works.
+		// `positionImpulse` is a real per-body field but isn't in
+		// `@types/matter-js` (matter exposes it as a solver internal);
+		// intersect the public Body type with the field we touch rather
+		// than discarding the type entirely.
+		const impulse = (body as Matter.Body & { positionImpulse: Matter.Vector })
+			.positionImpulse;
+		impulse.x = 0;
+		impulse.y = 0;
+	}
+
+	setAngle(renderable: Renderable, angle: number): void {
+		const body = this.bodyMap.get(renderable);
+		if (body) {
+			this.wake(body);
+			Matter.Body.setAngle(body, angle);
+		}
+	}
+
+	getAngle(renderable: Renderable): number {
+		const body = this.bodyMap.get(renderable);
+		return body ? body.angle : 0;
+	}
+
+	setAngularVelocity(renderable: Renderable, omega: number): void {
+		const body = this.bodyMap.get(renderable);
+		if (body) {
+			this.wake(body);
+			Matter.Body.setAngularVelocity(body, omega);
+		}
+	}
+
+	getAngularVelocity(renderable: Renderable): number {
+		const body = this.bodyMap.get(renderable);
+		return body ? body.angularVelocity : 0;
+	}
+
+	applyTorque(renderable: Renderable, torque: number): void {
+		const body = this.bodyMap.get(renderable);
+		if (body) {
+			this.wake(body);
+			body.torque += torque;
+		}
+	}
+
+	setStatic(renderable: Renderable, isStatic: boolean): void {
+		const body = this.bodyMap.get(renderable);
+		if (body) {
+			Matter.Body.setStatic(body, isStatic);
+		}
+	}
+
+	setGravityScale(renderable: Renderable, scale: number): void {
+		const body = this.bodyMap.get(renderable);
+		if (!body) return;
+		// matter-js 0.20 doesn't read body.gravityScale — track our own
+		// counter-force map (cleared on scale=1 to keep the hot path fast).
+		if (scale === 1) {
+			this.bodyGravityScale.delete(body);
+		} else {
+			this.bodyGravityScale.set(body, scale);
+		}
+	}
+
+	setSensor(renderable: Renderable, isSensor: boolean): void {
+		const body = this.bodyMap.get(renderable);
+		if (body) {
+			this._setSensor(body, isSensor);
+		}
+	}
+
+	/**
+	 * Make a body a sensor, or solid again, including while it is already
+	 * touching something. matter reads `isSensor` from the PARTS a pair
+	 * holds, and copies it into the pair only when the pair is created, so
+	 * the flag is written on every part (`parts[0]` is the body itself) and
+	 * on the pairs the body is already in. Without the latter a one-way
+	 * platform turned into a sensor under a standing player kept holding it
+	 * up.
+	 * @param body - the body to change
+	 * @param isSensor - `true` for a sensor, `false` for a solid body
+	 */
+	private _setSensor(body: Matter.Body, isSensor: boolean): void {
+		for (const part of body.parts) {
+			part.isSensor = isSensor;
+		}
+		for (const pair of this.engine.pairs.list) {
+			if (pair.bodyA.parent === body || pair.bodyB.parent === body) {
+				pair.isSensor = pair.bodyA.isSensor || pair.bodyB.isSensor;
+			}
+		}
+	}
+
+	setFrictionAir(
+		renderable: Renderable,
+		friction: number | { x: number; y: number },
+	): void {
+		const body = this.bodyMap.get(renderable);
+		if (body) {
+			body.frictionAir =
+				typeof friction === "number" ? friction : (friction.x + friction.y) / 2;
+		}
+	}
+
+	setMaxVelocity(
+		renderable: Renderable,
+		limit: { x: number; y: number },
+	): void {
+		const copy = { x: limit.x, y: limit.y };
+		if (this.bodyMap.has(renderable)) {
+			this.velocityLimits.set(renderable, copy);
+		} else {
+			// no body yet: kept for the one `addBody` builds, unless the
+			// body definition has a cap of its own
+			this.pendingLimits.set(renderable, copy);
+		}
+	}
+
+	getMaxVelocity(renderable: Renderable): { x: number; y: number } {
+		// a copy, so changing it does not change the cap; and no cap reads as
+		// Infinity, where `{ 0, 0 }` read as a cap that holds the body still
+		const limit =
+			this.velocityLimits.get(renderable) ?? this.pendingLimits.get(renderable);
+		return limit ? { x: limit.x, y: limit.y } : { x: Infinity, y: Infinity };
+	}
+
+	setCollisionType(renderable: Renderable, type: number): void {
+		const body = this.bodyMap.get(renderable);
+		if (body) {
+			// either name works (alias installed in addBody); the matter-
+			// native one is the canonical write
+			body.collisionFilter.category = type;
+		}
+	}
+
+	setCollisionMask(renderable: Renderable, mask: number): void {
+		const body = this.bodyMap.get(renderable);
+		if (body) {
+			body.collisionFilter.mask = mask;
+		}
+	}
+
+	/**
+	 * Adapter-side debug surface: the body's AABB in renderable-local
+	 * coordinates. Matter tracks `body.bounds` in WORLD space; we
+	 * subtract `renderable.pos` so the result matches melonJS's local-
+	 * space convention (the debug plugin translates to the renderable
+	 * origin before drawing, and would otherwise see the bounds drawn
+	 * offset by the renderable's world position).
+	 * @param renderable - the renderable whose body bounds to read
+	 * @param out - destination `Bounds` (filled in place, also returned)
+	 */
+	getBodyAABB(renderable: Renderable, out: Bounds): Bounds | undefined {
+		const body = this.bodyMap.get(renderable);
+		if (!body) return undefined;
+		const b = body.bounds;
+		const rp = renderable.pos;
+		out.setMinMax(
+			b.min.x - rp.x,
+			b.min.y - rp.y,
+			b.max.x - rp.x,
+			b.max.y - rp.y,
+		);
+		return out;
+	}
+
+	/**
+	 * Adapter-side debug surface: the body's collision shapes in
+	 * renderable-local coordinates, **at the body's current rotation**.
+	 *
+	 * The authored `def.shapes` are the pose the body was created with;
+	 * rotation lives in the physics body, not in them. Returning them
+	 * unrotated made anything reading this — the debug overlay most visibly —
+	 * describe a spinning body with an axis-aligned shape. Read-only.
+	 * @param renderable - the renderable whose body shapes to read
+	 */
+	getBodyShapes(renderable: Renderable): readonly BodyShape[] {
+		// Reported from MATTER'S OWN geometry, not by re-rotating the authored
+		// shapes. `part.vertices` are world-space and already carry the body's
+		// current pose, so there is no pivot to derive and nothing to keep in
+		// sync with `syncFromPhysics` — and it reports what actually collides,
+		// which the authored shapes do not: an Ellipse is simulated as a circle
+		// of the average radius, a degenerate polygon as its bounding box, and
+		// a concave one as convex chunks.
+		const body = this.bodyMap.get(renderable);
+		if (body === undefined) {
+			return [];
+		}
+		const parts = body.parts;
+		// a compound body's real shapes are `parts[1..N]`; `parts[0]` is the
+		// wrapper whose vertices are the convex hull. Same walk as the raycast.
+		const startIdx = parts.length > 1 ? 1 : 0;
+		const count = parts.length - startIdx;
+
+		let cached = this.reportedShapes.get(renderable);
+		// rebuilt only when the STRUCTURE changes — the pose is refreshed in
+		// place below, so a spinning body allocates nothing per frame (the
+		// debug overlay calls this once per body per frame)
+		if (cached === undefined || cached.length !== count) {
+			cached = [];
+			this.reportedShapes.set(renderable, cached);
+		}
+
+		const rx = renderable.pos.x;
+		const ry = renderable.pos.y;
+		for (let p = startIdx; p < parts.length; p++) {
+			const part = parts[p];
+			const i = p - startIdx;
+			const radius = (part as { circleRadius?: number }).circleRadius;
+			if (typeof radius === "number" && radius > 0) {
+				// a circle has no vertex list; report the circle matter
+				// actually simulates rather than the ellipse that was authored
+				const existing = cached[i];
+				if (existing instanceof Ellipse) {
+					existing.pos.set(part.position.x - rx, part.position.y - ry);
+					existing.radiusV.set(radius, radius);
+				} else {
+					cached[i] = new Ellipse(
+						part.position.x - rx,
+						part.position.y - ry,
+						radius * 2,
+						radius * 2,
+					);
+				}
+				continue;
+			}
+			const vertices = part.vertices;
+			const existing = cached[i];
+			if (
+				existing instanceof Polygon &&
+				existing.points.length === vertices.length
+			) {
+				// mutate in place: `recalc` reuses its edge/normal slots, so
+				// the steady state is allocation-free
+				for (let v = 0; v < vertices.length; v++) {
+					existing.points[v].set(vertices[v].x - rx, vertices[v].y - ry);
+				}
+				existing.pos.set(0, 0);
+				existing.recalc();
+				existing.updateBounds();
+			} else {
+				// matter guarantees at least three vertices for a polygon part;
+				// the cast satisfies Polygon's "three or more" tuple type,
+				// which a `map` result cannot prove on its own
+				cached[i] = new Polygon(
+					0,
+					0,
+					vertices.map((v) => {
+						return new Vector2d(v.x - rx, v.y - ry);
+					}) as unknown as ConstructorParameters<typeof Polygon>[2],
+				);
+			}
+		}
+		return cached;
+	}
+
+	/**
+	 * Whether matter has put the body to sleep: a dynamic body at rest,
+	 * which it leaves out of the simulation until a contact, a force or a
+	 * velocity wakes it. Only with `matterEngineOptions.enableSleeping`.
+	 * `false` for a static body and for a renderable this adapter does not
+	 * know. matter has no kinematic bodies: a `"kinematic"` one is built
+	 * dynamic, and sleeps as one.
+	 * @param renderable - the renderable whose body to read
+	 * @returns `true` while the body sleeps
+	 */
+	isSleeping(renderable: Renderable): boolean {
+		const body = this.bodyMap.get(renderable);
+		return body !== undefined && !body.isStatic && body.isSleeping;
+	}
+
+	isGrounded(renderable: Renderable): boolean {
+		const body = this.bodyMap.get(renderable);
+		if (!body) return false;
+		// "Grounded" = at least one active contact that pushes us UP, the
+		// rule the builtin adapter applies too: a side contact (a wall)
+		// never lands a body. Comparing the other body's centre instead
+		// made the side of a tall wall count once the player's centre was
+		// above the wall's, so a player could climb it with repeated jumps.
+		//
+		// matter's pairs hold PARTS, so a compound body (several shapes, or
+		// a concave outline matter decomposed) is matched through
+		// `parent`, which is the body itself for a simple body.
+		// `collision.normal` is the direction `bodyA` moves to separate
+		// (matter orients it away from `bodyB` and its solver pushes
+		// `bodyA` along it), so it is negated for the `bodyB` side.
+		for (const pair of this.engine.pairs.list) {
+			if (!pair.isActive) continue;
+			const isA = pair.bodyA.parent === body;
+			const isB = pair.bodyB.parent === body;
+			if (isA === isB) continue;
+			if (pair.isSensor) {
+				// A sensor pushes nothing, so it keeps the rule it always
+				// had: the other body's centre is below ours. Games use a
+				// sensor with a response of their own as ground (the
+				// platformer-matter example's slopes snap the player up),
+				// and rely on it to jump from there.
+				const other = isA ? pair.bodyB : pair.bodyA;
+				if (other.position.y > body.position.y) {
+					return true;
+				}
+				continue;
+			}
+			const ny = isA ? pair.collision.normal.y : -pair.collision.normal.y;
+			if (ny < -GROUND_NORMAL_Y) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	raycast(from: Vector2d, to: Vector2d): RaycastHit | null {
+		const dx = to.x - from.x;
+		const dy = to.y - from.y;
+		if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) return null;
+
+		// Use `Matter.Query.ray` as a coarse AABB-broadphase filter, then
+		// do precise segment-vs-edge intersection per body to find the
+		// actual entry point + surface normal (matter only gives us a
+		// collision pair, not a parametric hit, so we compute it
+		// ourselves). Matches the precision BuiltinAdapter provides.
+		const bodies = Matter.Composite.allBodies(this.engine.world);
+		const collisions = Matter.Query.ray(bodies, from, to);
+		if (collisions.length === 0) return null;
+
+		// Inner-loop hot path. Keep only the edge vector for the winning
+		// edge (`bestEdgeX/Y`) — defer the unit-vector normalise + flip
+		// to the single survivor after the loop, instead of running them
+		// for every edge that briefly held bestT.
+		let bestT = Infinity;
+		let bestEdgeX = 0;
+		let bestEdgeY = 0;
+		let bestBody: Matter.Body | null = null;
+
+		for (const collision of collisions) {
+			const candidate = collision.bodyA;
+			// a part the ray starts inside is not hit, as on the other
+			// adapters: a body casting from its own centre does not see itself
+			if (Matter.Vertices.contains(candidate.vertices, from)) {
+				continue;
+			}
+			// Compound bodies expose actual collision shapes in
+			// `parts[1..N]`; `parts[0]` is the parent wrapper whose
+			// vertices are the convex hull, not the per-part shapes. For
+			// simple bodies `parts.length === 1` and parts[0] IS the body.
+			const parts = candidate.parts;
+			const startIdx = parts.length > 1 ? 1 : 0;
+			for (let p = startIdx; p < parts.length; p++) {
+				const vertices = parts[p].vertices;
+				const vlen = vertices.length;
+				for (let i = 0; i < vlen; i++) {
+					const a = vertices[i];
+					// `i + 1 === vlen ? 0 : i + 1` avoids the modulo
+					// (~2× faster than `(i + 1) % vlen` in V8).
+					const b = vertices[i + 1 === vlen ? 0 : i + 1];
+					const ex = b.x - a.x;
+					const ey = b.y - a.y;
+					const denom = dx * ey - dy * ex;
+					// Inline `|denom| < eps` without the Math.abs call.
+					if (denom > -1e-9 && denom < 1e-9) continue;
+					const fx = a.x - from.x;
+					const fy = a.y - from.y;
+					const t = (fx * ey - fy * ex) / denom;
+					// Early reject on t before computing s — most edges
+					// fail this check, so skipping s saves a divide.
+					if (t < 0 || t > 1 || t >= bestT) continue;
+					const s = (fx * dy - fy * dx) / denom;
+					if (s < 0 || s > 1) continue;
+					bestT = t;
+					bestEdgeX = ex;
+					bestEdgeY = ey;
+					bestBody = candidate;
+				}
+			}
+		}
+
+		if (bestBody === null) return null;
+		// `Query.ray` reports the PART it hit, which for a body made of
+		// several shapes (or a concave polygon matter split into pieces) is
+		// not the body the renderable owns: resolve it through its parent
+		const renderable = this._renderableForPart(bestBody);
+		if (!renderable) return null;
+
+		// Edge outward normal — perpendicular to the winning edge,
+		// flipped to point back toward the ray origin (Box2D convention).
+		let nx = bestEdgeY;
+		let ny = -bestEdgeX;
+		const nLen = Math.sqrt(nx * nx + ny * ny);
+		if (nLen > 0) {
+			nx /= nLen;
+			ny /= nLen;
+		}
+		if (nx * dx + ny * dy > 0) {
+			nx = -nx;
+			ny = -ny;
+		}
+
+		return {
+			renderable,
+			point: new Vector2d(from.x + dx * bestT, from.y + dy * bestT),
+			normal: new Vector2d(nx, ny),
+			fraction: bestT,
+		};
+	}
+
+	queryAABB(rect: Rect): Renderable[] {
+		const bodies = Matter.Composite.allBodies(this.engine.world);
+		const matched = Matter.Query.region(bodies, {
+			min: { x: rect.pos.x, y: rect.pos.y },
+			max: { x: rect.pos.x + rect.width, y: rect.pos.y + rect.height },
+		});
+		const result: Renderable[] = [];
+		for (const b of matched) {
+			const r = this.renderableMap.get(b);
+			if (r) result.push(r);
+		}
+		return result;
+	}
+
+	// ---------------------------------------------------------------------
+	// Internal helpers
+	// ---------------------------------------------------------------------
+
+	private _clampVelocities(): void {
+		for (const [renderable, limit] of this.velocityLimits) {
+			const body = this.bodyMap.get(renderable);
+			if (!body) continue;
+			const clamp = (value: number, cap: number) => {
+				// one that is not a number caps nothing (it would turn the
+				// velocity itself into NaN); a negative one caps by its size
+				if (Number.isNaN(cap)) return value;
+				const m = Math.abs(cap);
+				return Math.max(-m, Math.min(m, value));
+			};
+			const vx = clamp(body.velocity.x, limit.x);
+			const vy = clamp(body.velocity.y, limit.y);
+			if (vx !== body.velocity.x || vy !== body.velocity.y) {
+				Matter.Body.setVelocity(body, { x: vx, y: vy });
+			}
+		}
+	}
+
+	private _dispatchCollisions(
+		pairs: Matter.Pair[],
+		phase: "start" | "active" | "end",
+	): void {
+		for (const pair of pairs) {
+			// matter reports collisions between PARTS. A compound body's parts
+			// are not in `renderableMap` (only the parent is), so looking the
+			// pair bodies up directly meant every multi-shape body silently
+			// received NO collision events at all — not the new shape-level
+			// ones, and not `onCollision` / `onCollisionStart` either. Resolve
+			// through `.parent`, which matter sets to the body itself for a
+			// simple body, so both cases take one path. A hook earlier in this
+			// event may have removed one of them.
+			const rA = this._renderableForPart(pair.bodyA);
+			const rB = this._renderableForPart(pair.bodyB);
+			if (!rA || !rB) continue;
+			this._dispatchPair(pair, rA, rB, phase);
+		}
+	}
+
+	/**
+	 * Fire the hooks of one pair, on both renderables. A start or active
+	 * hook may take a body of the pair out: see {@link Dispatch}.
+	 * @param pair the matter pair
+	 * @param rA the renderable owning `pair.bodyA`
+	 * @param rB the renderable owning `pair.bodyB`
+	 * @param phase which lifecycle hook to fire
+	 */
+	private _dispatchPair(
+		pair: Matter.Pair,
+		rA: Renderable,
+		rB: Renderable,
+		phase: "start" | "active" | "end",
+	): void {
+		if (phase === "end") {
+			// a pair already ended (one of its bodies was removed), or never
+			// started, is not ended again
+			if (this.started.delete(pair.id)) {
+				this._dispatch(pair, rA, rB, phase, EVERY_SIDE);
+			}
+			return;
+		}
+		if (phase === "start") {
+			this.started.add(pair.id);
+		} else if (!this.started.has(pair.id)) {
+			return;
+		}
+		const normal = pair.collision.normal;
+		const current: Dispatch = {
+			pair,
+			rA,
+			rB,
+			normal: { x: normal.x, y: normal.y },
+			depth: pair.collision.depth,
+			entryA: this.partShapeMap.get(pair.bodyA),
+			entryB: this.partShapeMap.get(pair.bodyB),
+			// a pair already active had its start on every side
+			reached: phase === "start" ? 0 : EVERY_SIDE,
+			told: 0,
+			ended: false,
+		};
+		this.dispatching.push(current);
+		try {
+			this._dispatch(
+				pair,
+				rA,
+				rB,
+				phase,
+				EVERY_SIDE,
+				phase === "start" ? current : undefined,
+				current,
+			);
+		} finally {
+			this.dispatching.splice(this.dispatching.indexOf(current), 1);
+		}
+		if (current.ended) {
+			this._dispatch(
+				pair,
+				rA,
+				rB,
+				"end",
+				current.reached & ~current.told,
+				undefined,
+				current,
+			);
+		}
+	}
+
+	/**
+	 * Tell the pairs touching a renderable whose body is about to go that
+	 * they ended.
+	 * @param renderable the renderable whose body is leaving the world
+	 */
+	private _endContacts(renderable: Renderable): void {
+		// a pair whose start or active hooks are running: the side going out
+		// hears the end now, the other once those hooks are done, so that no
+		// one hears of an end before its start
+		for (const d of this.dispatching) {
+			const going =
+				(d.rA === renderable ? SIDE_A | SHAPE_A : 0) |
+				(d.rB === renderable ? SIDE_B | SHAPE_B : 0);
+			if (going !== 0 && (this.started.delete(d.pair.id) || d.ended)) {
+				d.ended = true;
+				const sides = going & d.reached & ~d.told;
+				d.told |= sides;
+				this._dispatch(d.pair, d.rA, d.rB, "end", sides, undefined, d);
+			}
+		}
+		const ending = this.engine.pairs.list.filter((pair: Matter.Pair) => {
+			return (
+				this.started.has(pair.id) &&
+				(this._renderableForPart(pair.bodyA) === renderable ||
+					this._renderableForPart(pair.bodyB) === renderable)
+			);
+		});
+		this._dispatchCollisions(ending, "end");
+	}
+
+	/**
+	 * Fire one phase of a pair's hooks: the renderables' own, then the
+	 * shape-level ones. A renderable whose body is gone hears nothing.
+	 * @param pair the matter pair
+	 * @param rA the renderable owning `pair.bodyA`
+	 * @param rB the renderable owning `pair.bodyB`
+	 * @param phase which lifecycle hook to fire
+	 * @param sides the sides and levels to fire it on, as bits
+	 * @param [record] where to note each side reached, before its hook runs
+	 * @param [known] the pair as its hooks began, when a body of it may
+	 * since have gone
+	 */
+	private _dispatch(
+		pair: Matter.Pair,
+		rA: Renderable,
+		rB: Renderable,
+		phase: "start" | "active" | "end",
+		sides: number,
+		record?: Dispatch,
+		known?: Dispatch,
+	): void {
+		// Detachment handling. `ancestor === null` means the renderable
+		// was attached to a container and later detached (removeChild,
+		// mid-step level reload). `ancestor === undefined` means it was
+		// never in a tree at all (unit tests adding bodies directly to
+		// the adapter) — leave those alone.
+		//
+		// For START / ACTIVE phases: if either partner is detached the
+		// pair is stale, skip the whole dispatch.
+		//
+		// For END phase: dispatch to whichever partner is still attached
+		// — they want to know their neighbor just left. Skip only when
+		// both are gone.
+		const ancA = (rA as Renderable & { ancestor?: object | null }).ancestor;
+		const ancB = (rB as Renderable & { ancestor?: object | null }).ancestor;
+		// eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- runtime guard: ancestor is set to null by Container on removeChild; TS narrows it away on the cast
+		const aDetached = ancA === null;
+		// eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- runtime guard: ancestor is set to null by Container on removeChild; TS narrows it away on the cast
+		const bDetached = ancB === null;
+		if (phase === "end") {
+			if (aDetached && bDetached) return;
+		} else if (aDetached || bDetached) {
+			return;
+		}
+		// a hook earlier in this dispatch may have removed a body: its
+		// renderable hears nothing from then on
+		const reaches = (side: number, receiver: Renderable, detached: boolean) => {
+			if ((sides & side) === 0 || detached || !this.bodyMap.has(receiver)) {
+				return false;
+			}
+			if (record !== undefined) {
+				record.reached |= side;
+			}
+			return true;
+		};
+		// Pick the single handler to dispatch for each side. The supersedes
+		// rule (modern `onCollisionActive` wins over legacy `onCollision`
+		// when both are defined) is baked into the picker.
+		//
+		// `onCollision` is the legacy every-frame alias; legacy melonJS
+		// SAT fires it every frame two bodies overlap, which maps to
+		// matter's `collisionActive`. Routing it there preserves legacy
+		// semantics for code that never migrated to the modern hooks.
+		const methodForSide = (receiver: Renderable): string => {
+			if (phase === "start") return "onCollisionStart";
+			if (phase === "end") return "onCollisionEnd";
+			// active: modern handler wins if defined, else fall back to legacy
+			return typeof (receiver as Renderable & { onCollisionActive?: unknown })
+				.onCollisionActive === "function"
+				? "onCollisionActive"
+				: "onCollision";
+		};
+		// Matter-native response shape passed to user handlers.
+		//
+		//   - `a` / `b` — receiver and partner renderables. We dispatch
+		//     once per side, so each side sees itself as `a`.
+		//   - `normal` — unit MTV (minimum translation vector) for the
+		//     receiver. Direction `this` must move to separate from
+		//     `other`. Matter's `pair.collision.normal` is already the
+		//     MTV of `bodyA`; for the B-side dispatch we negate so each
+		//     handler sees the normal from its own perspective.
+		//       `normal.y < -0.7`  → push me up to escape  (I'm on top → stomp)
+		//       `normal.y >  0.7`  → push me down to escape (I'm below → being stomped on)
+		//   - `depth` — penetration depth (matter native name).
+		//   - `pair` — raw `Matter.Pair`, exposed for advanced use
+		//     (supports, tangent, body refs, etc.).
+		const { normal, depth } = known ?? pair.collision;
+		const emit = (receiver: Renderable, other: Renderable, sign: number) => {
+			const fn = (receiver as Renderable & Record<string, unknown>)[
+				methodForSide(receiver)
+			];
+			if (typeof fn !== "function") return;
+			(fn as (response: unknown, other: Renderable) => unknown).call(
+				receiver,
+				{
+					a: receiver,
+					b: other,
+					// (`+ 0` keeps a zero component from reading as -0)
+					normal: { x: sign * normal.x + 0, y: sign * normal.y + 0 },
+					depth,
+					pair,
+				},
+				other,
+			);
+		};
+		if (reaches(SIDE_A, rA, aDetached)) {
+			emit(rA, rB, 1);
+		}
+		if (reaches(SIDE_B, rB, bDetached)) {
+			emit(rB, rA, -1);
+		}
+
+		// shape-level hooks, after the pair-level ones so ordering matches
+		// the builtin adapter (melonjs#1596)
+		this._dispatchShapeContacts(
+			known ? known.entryA : this.partShapeMap.get(pair.bodyA),
+			known ? known.entryB : this.partShapeMap.get(pair.bodyB),
+			rA,
+			rB,
+			normal,
+			depth,
+			phase,
+			() => {
+				return reaches(SHAPE_A, rA, aDetached);
+			},
+			() => {
+				return reaches(SHAPE_B, rB, bDetached);
+			},
+		);
+	}
+
+	/**
+	 * Resolve the renderable owning a matter body or one of its parts.
+	 *
+	 * matter sets `parent` to the body itself on a simple body, so a compound
+	 * part and a standalone body take the same path.
+	 * @param part the matter body or compound part to resolve
+	 * @returns the owning renderable, or undefined when unregistered
+	 */
+	private _renderableForPart(part: Matter.Body): Renderable | undefined {
+		return (
+			this.renderableMap.get(part) ??
+			(part.parent && part.parent !== part
+				? this.renderableMap.get(part.parent)
+				: undefined)
+		);
+	}
+
+	/**
+	 * Fire the shape-level collision hooks for one matter pair.
+	 *
+	 * matter's pairs are already per-PART, so a compound body overlapping
+	 * through several parts produces several pairs and every one of them is
+	 * reported — which is exactly the enumeration melonjs#1596 asks for.
+	 * Bodies whose parts were not built from a melonJS shape are skipped.
+	 * @param entryA the shape the part on A's side was built from
+	 * @param entryB the shape the part on B's side was built from
+	 * @param rA renderable owning part A
+	 * @param rB renderable owning part B
+	 * @param normal the pair's `collision.normal`: the direction A must move
+	 * to separate from B, as the body-level hooks hand it to A
+	 * @param normal.x normal x component
+	 * @param normal.y normal y component
+	 * @param depth penetration depth
+	 * @param phase which lifecycle hook to fire
+	 * @param toA whether A's hook fires, asked just before it would
+	 * @param toB whether B's hook fires, asked just before it would
+	 */
+	private _dispatchShapeContacts(
+		entryA: ShapeEntry | undefined,
+		entryB: ShapeEntry | undefined,
+		rA: Renderable,
+		rB: Renderable,
+		normal: { x: number; y: number },
+		depth: number,
+		phase: "start" | "active" | "end",
+		toA: () => boolean,
+		toB: () => boolean,
+	): void {
+		if (entryA === undefined || entryB === undefined) {
+			return;
+		}
+		const method =
+			phase === "start"
+				? "onShapeCollisionStart"
+				: phase === "end"
+					? "onShapeCollisionEnd"
+					: "onShapeCollisionActive";
+		const isTrigger =
+			(entryA.shape as { isTrigger?: boolean }).isTrigger === true ||
+			(entryB.shape as { isTrigger?: boolean }).isTrigger === true;
+		const emit = (
+			receiver: Renderable,
+			partner: Renderable,
+			own: { shape: BodyShape; index: number },
+			other: { shape: BodyShape; index: number },
+			nx: number,
+			ny: number,
+		): void => {
+			const fn = (receiver as Renderable & Record<string, unknown>)[method];
+			if (typeof fn !== "function") {
+				return;
+			}
+			// separated contacts carry identity only, matching the builtin
+			const d = phase === "end" ? 0 : depth;
+			(fn as (contact: unknown, other: Renderable) => unknown).call(
+				receiver,
+				{
+					a: receiver,
+					b: partner,
+					shapeA: own.shape,
+					shapeB: other.shape,
+					indexShapeA: own.index,
+					indexShapeB: other.index,
+					isTrigger,
+					depth: d,
+					overlap: d,
+					// (`+ 0` keeps a zero component from reading as -0)
+					normal: { x: nx + 0, y: ny + 0 },
+					// the legacy SAT fields `ShapeCollisionContact` declares, in
+					// the builtin's convention: `overlapN` is the opposite of
+					// `normal`, `overlapV` is `overlapN` scaled by the depth, and
+					// a 2D engine has no Z
+					overlapN: { x: -nx + 0, y: -ny + 0 },
+					overlapV: { x: -nx * d + 0, y: -ny * d + 0 },
+					overlapZ: 0,
+					overlapNZ: 0,
+					normalZ: 0,
+				},
+				partner,
+			);
+		};
+		// oriented as the body-level response is: each receiver gets the
+		// direction it must move to separate. These were negated, so a
+		// shape hook pointed into the partner while `onCollisionStart`
+		// pointed away from it.
+		if (toA()) {
+			emit(rA, rB, entryA, entryB, normal.x, normal.y);
+		}
+		if (toB()) {
+			emit(rB, rA, entryB, entryA, -normal.x, -normal.y);
+		}
+	}
+
+	private _shapeToMatter(
+		shape: BodyShape,
+		baseX: number,
+		baseY: number,
+	): Matter.Body {
+		// A `Line` is two points and no area. Checked BEFORE `Polygon`,
+		// which it extends, and before `Rect`, so it never reaches the
+		// degenerate-hull path.
+		if (shape instanceof Line) {
+			const [a, b] = shape.points;
+			const dx = b.x - a.x;
+			const dy = b.y - a.y;
+			const length = Math.hypot(dx, dy);
+			if (length > 0) {
+				// Built from explicit VERTICES rather than a rectangle with an
+				// `angle`: an angle on the body is a rotation of the BODY, and
+				// `syncFromPhysics` mirrors that onto the renderable's
+				// transform, so the sprite would be turned by the slope of its
+				// own ground and the already-rotated shapes would be drawn
+				// turned a second time.
+				const nx = (-dy / length) * (LINE_THICKNESS / 2);
+				const ny = (dx / length) * (LINE_THICKNESS / 2);
+				const ox = baseX + shape.pos.x;
+				const oy = baseY + shape.pos.y;
+				const quad = [
+					{ x: ox + a.x + nx, y: oy + a.y + ny },
+					{ x: ox + b.x + nx, y: oy + b.y + ny },
+					{ x: ox + b.x - nx, y: oy + b.y - ny },
+					{ x: ox + a.x - nx, y: oy + a.y - ny },
+				];
+				const centre = Matter.Vertices.centre(quad);
+				const body: Matter.Body | undefined = Matter.Bodies.fromVertices(
+					centre.x,
+					centre.y,
+					[quad],
+				);
+				if (body) {
+					return body;
+				}
+			}
+			// a zero-length segment has no orientation to follow; let it fall
+			// through to the degenerate handling below rather than inventing one
+		}
+		if (shape instanceof Rect) {
+			// melonJS Rect: pos is top-left in shape-local space. Matter
+			// rectangles are centered, so we shift by half-width/half-height.
+			const w = shape.width;
+			const h = shape.height;
+			return Matter.Bodies.rectangle(
+				baseX + shape.pos.x + w / 2,
+				baseY + shape.pos.y + h / 2,
+				w,
+				h,
+			);
+		}
+		if (shape instanceof Ellipse) {
+			// Matter has no native ellipse — approximate as a circle with the
+			// average radius. For tall/narrow ellipses this is a poor fit;
+			// a future improvement could synthesize a polygon hull.
+			const radius = (shape.radiusV.x + shape.radiusV.y) / 2;
+			return Matter.Bodies.circle(
+				baseX + shape.pos.x,
+				baseY + shape.pos.y,
+				radius,
+			);
+		}
+		if (shape instanceof Polygon) {
+			// translate polygon vertices into world-space, then let Matter
+			// recompute its own center / vertex list
+			const points = shape.points.map((p) => ({
+				x: baseX + shape.pos.x + p.x,
+				y: baseY + shape.pos.y + p.y,
+			}));
+			// `fromVertices` places the polygon's AREA CENTROID at the
+			// position it is given: it translates the vertex list by
+			// `-Vertices.centre(...)` and then moves it to that position.
+			// So the position handed to it has to be that same centroid for
+			// the vertices to land where they were authored. The arithmetic
+			// mean of the points is a different point entirely, and using it
+			// shifted every polygon by `mean - centroid`.
+			//
+			// That difference is zero exactly when the vertices are evenly
+			// distributed — a rectangle, and any triangle — which is why
+			// simple test shapes never showed it, and it grows with how
+			// lopsided the distribution is. A traced outline out of a shape
+			// editor is the worst case, since such a tool puts vertices
+			// densely along curves and sparsely along straights: measured at
+			// ~39px of drift on a 200px blob, with the collision geometry
+			// visibly off the artwork it was drawn on.
+			const centre = Matter.Vertices.centre(points);
+			// `Vertices.centre` divides by the polygon area, so a degenerate
+			// (collinear / zero-area) outline yields a non-finite centre
+			// rather than throwing.
+			// The annotation is load-bearing: matter-js types `fromVertices`
+			// as non-null, but it returns undefined for a degenerate polygon.
+			const body: Matter.Body | undefined =
+				Number.isFinite(centre.x) && Number.isFinite(centre.y)
+					? Matter.Bodies.fromVertices(centre.x, centre.y, [points])
+					: undefined;
+			if (body) {
+				return body;
+			}
+			// Degenerate polygon: no usable centroid, and `fromVertices`
+			// returns undefined for one anyway. Fall back to an
+			// axis-aligned bounding box so the body still exists in
+			// the simulation rather than disappearing silently.
+			let minX = Number.POSITIVE_INFINITY;
+			let minY = Number.POSITIVE_INFINITY;
+			let maxX = Number.NEGATIVE_INFINITY;
+			let maxY = Number.NEGATIVE_INFINITY;
+			for (const p of points) {
+				if (p.x < minX) minX = p.x;
+				if (p.y < minY) minY = p.y;
+				if (p.x > maxX) maxX = p.x;
+				if (p.y > maxY) maxY = p.y;
+			}
+			const w = Math.max(1, maxX - minX);
+			const h = Math.max(1, maxY - minY);
+			return Matter.Bodies.rectangle(minX + w / 2, minY + h / 2, w, h);
+		}
+		throw new Error(unsupportedShapeMessage("MatterAdapter", shape));
+	}
+}
+
+/**
+ * Namespace-merged with the {@link MatterAdapter} class to expose
+ * adapter-owned types alongside the runtime API. Access via
+ * `MatterAdapter.Body`, etc.
+ */
+// biome-ignore lint/style/useNamingConvention: namespace must match the class it merges with
+// eslint-disable-next-line @typescript-eslint/no-namespace -- intentional class+namespace declaration merge so adapter-owned types (`MatterAdapter.Body`) are reachable alongside the runtime class; cannot be expressed as a separate ES2015 module export
+export namespace MatterAdapter {
+	/**
+	 * The concrete body handle attached to `renderable.body` under
+	 * {@link MatterAdapter}. Combines the raw `Matter.Body` (with all
+	 * native fields — `frictionAir`, `restitution`, `friction`, `angle`,
+	 * `angularVelocity`, …) with the portable melonJS helper methods
+	 * (`setVelocity`, `applyImpulse`, `setStatic`, etc.) spliced on at
+	 * `addBody` time.
+	 *
+	 * Type it explicitly when reaching for matter-native fields:
+	 *
+	 * ```ts
+	 * (this.body as MatterAdapter.Body).frictionAir = 0.02;
+	 * ```
+	 *
+	 * Keeps user code free of a direct `matter-js` import — the matter
+	 * dependency stays behind the adapter boundary.
+	 */
+	export type Body = ReturnType<typeof Matter.Body.create> & PhysicsBody;
+}

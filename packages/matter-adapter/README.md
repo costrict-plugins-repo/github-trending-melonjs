@@ -1,0 +1,665 @@
+# @melonjs/matter-adapter
+
+![melonJS Logo](https://github.com/melonjs/melonJS/raw/master/media/Banner/Banner%20-%20Billboard%20-%20Original%20Logo%20-%20horizontal.png)
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/melonjs/melonJS/blob/master/LICENSE)
+[![NPM Package](https://img.shields.io/npm/v/@melonjs/matter-adapter)](https://www.npmjs.com/package/@melonjs/matter-adapter)
+
+A [matter-js](https://brm.io/matter-js/) physics adapter for melonJS — drops in for the built-in SAT physics and gives you matter's rigid-body simulation, rotational dynamics, constraints, sleeping bodies, and raycasting.
+
+**Per-object collision dispatch is already wired up.** Every `Renderable` receives `onCollisionStart(response, other)`, `onCollisionActive(response, other)`, and `onCollisionEnd(response, other)` callbacks — the same shape you use under the built-in adapter. No rewrite. No world-level pair firehose to filter yourself. The matter integration handles the pair-to-renderable routing for you.
+
+## Installation
+
+```bash
+npm install @melonjs/matter-adapter
+```
+
+`matter-js` is a regular dependency of the adapter, so it is installed with it and you don't need to install it yourself. The only peer dependency is `melonjs` 20.0 or later, because melonJS provides the `PhysicsAdapter` interface this package implements.
+
+## Usage
+
+Create the adapter with `MatterAdapter.create()` and pass it as the `physic` option when constructing your `Application`:
+
+```ts
+import { MatterAdapter } from "@melonjs/matter-adapter";
+import { Application, video } from "melonjs";
+
+const app = new Application(800, 600, {
+    parent: "screen",
+    renderer: video.AUTO,
+    physic: await MatterAdapter.create({
+        gravity: { x: 0, y: 5 },
+    }),
+});
+
+// mandatory since melonJS 20.0: the renderer is built here
+await app.init();
+```
+
+That's it — every renderable that declares a `bodyDef` gets registered with matter automatically on `Container.addChild`, and the rest of your game code (collision handlers, velocity reads, gravity tweaks, etc.) talks to the shared [`PhysicsAdapter`](https://melonjs.github.io/melonJS/) interface so it works with either adapter.
+
+`create()` is the form every melonJS physics adapter shares (see `PhysicsAdapterClass` in the melonJS API): it waits for the adapter's `load()`, then constructs it, so the same line works for an adapter whose engine is WebAssembly and has to be downloaded first. matter-js is plain JavaScript and needs no loading, so here `load()` resolves at once and `new MatterAdapter({ ... })` does exactly the same thing. It stays supported.
+
+### Options
+
+The options go in the `MatterAdapter.create({ ... })` call you pass as `physic` above. They are all optional; this is that call with each one at its default:
+
+```ts
+physic: await MatterAdapter.create({
+    gravity: { x: 0, y: 1 },
+    subSteps: 1,
+    // forwarded to Matter.Engine.create; these are matter's own defaults
+    matterEngineOptions: { positionIterations: 6, velocityIterations: 4 },
+}),
+```
+
+`gravity` can also change while the game runs: the adapter reads `app.world.adapter.gravity` at every step, so `app.world.adapter.gravity.set(0, 5)` applies from the next one. It also overrides any `x` / `y` given in `matterEngineOptions.gravity`.
+
+The other options cannot change on a live adapter. To change them, switch to a new one with `app.world.setAdapter(await MatterAdapter.create({ ... }))`, which rebuilds every body from its `bodyDef`, at rest. The matter engine's own settings stay writable on `adapter.engine`: `positionIterations`, `velocityIterations` and `enableSleeping` are read at every step.
+
+The defaults are matter-js native (`gravity = (0, 1)` with `gravity.scale = 0.001`). For an arcade-feel platformer where the player moves a few px per step, you usually want a stronger `gravity.y` (e.g. `4`–`6`).
+
+`subSteps` divides the per-frame delta into `N` smaller integration steps. matter has no continuous collision detection: a body that moves more than about one collision radius per step can pass through a wall or another body. For very fast objects (break shots in a pool game, projectiles, high-velocity launches), raise this to `2`–`4`, at the cost of `N×` solver work. The default `1` reproduces the legacy single-step behaviour exactly.
+
+Two side effects to know about. matter clears forces after every substep, so a force or torque applied once in a frame acts on the first substep only and moves the body about `1/N` as much. And `onCollisionActive` fires once per substep, so `N` times per frame.
+
+## Collision Events
+
+The adapter dispatches matter's three native collision events to renderable hooks:
+
+```ts
+class Player extends Sprite {
+    // fires once when two bodies begin contact
+    onCollisionStart(response, other) { /* stomp, pickup, trigger entry */ }
+
+    // fires every frame while two bodies remain in contact
+    onCollisionActive(response, other) { /* sustained damage, conveyor friction */ }
+
+    // fires once when two bodies separate
+    onCollisionEnd(response, other) { /* left the platform, exited a zone */ }
+}
+```
+
+Implement only the ones you need — missing methods are silently skipped. The same three handlers also fire on the builtin SAT adapter (it synthesizes start/end via a frame diff), so handler code stays portable.
+
+A legacy `onCollision(response, other)` handler still fires, at every step of a contact, but only on a renderable that has no `onCollisionActive`. It receives the response described below, not the legacy SAT one, so `overlapV` and `overlapN` are `undefined`.
+
+### The `response` object
+
+The first argument passed to every collision hook is a matter-native response object:
+
+```ts
+response = {
+    a:      Renderable,                 // this renderable (the one whose handler is firing)
+    b:      Renderable,                 // the other renderable
+    normal: { x: number, y: number },   // unit MTV for `a` (direction to escape)
+    depth:  number,                     // penetration depth (always positive)
+    pair:   Matter.Pair,                // raw matter pair (supports, tangent, bodies, …)
+}
+```
+
+**`normal` direction** — the minimum-translation vector *for the receiver*. It points in the direction `this` (a.k.a. `response.a`) must move to separate from `other`. Each side of the dispatch sees its own MTV, so the normals on the two handlers are mirrored.
+
+In canvas coordinates (y grows downward):
+
+- `normal.y < -0.7` → push me **up** to escape ⇒ I'm sitting on top of `other` (classic stomp / landing).
+- `normal.y >  0.7` → push me **down** to escape ⇒ I'm underneath (head-bumped a ceiling, got stomped on).
+- `Math.abs(normal.x) > 0.7` → mostly horizontal contact ⇒ side hit.
+
+`response.pair` is matter's native `Pair` (with `bodyA`, `bodyB`, `collision.supports`, `collision.tangent`, etc.) for advanced use. Note that `pair.collision.normal` is matter's raw normal (always the MTV of `pair.bodyA`); use the symmetric `response.normal` unless you specifically need the body-A-relative form.
+
+### Shape-level events
+
+A body made of several shapes can also learn which of its shapes was touched. `onShapeCollisionStart(contact, other)`, `onShapeCollisionActive` and `onShapeCollisionEnd` fire once per overlapping pair of shapes, right after the body-level hook for that contact. Each melonJS shape becomes one matter part, and matter reports contacts per part, so this is native here.
+
+`contact.shapeA` and `contact.indexShapeA` are your own shape and its index in `bodyDef.shapes`; `contact.shapeB` and `contact.indexShapeB` are the other body's. `contact.normal` and `contact.depth` follow the same rule as `response.normal` and `response.depth` above, and the depth is `0` in `onShapeCollisionEnd`.
+
+## Body helper methods
+
+The canonical portable surface is the `PhysicsAdapter` interface, and every method below except `setMass` and `setBounce` is also reachable as `adapter.X(renderable, ...)`. As a convenience this adapter bolts the same operations onto `renderable.body` so the idiomatic form available on built-in `me.Body` works here too:
+
+```ts
+// Linear kinematics
+body.setVelocity(x, y)                       // ⇔ adapter.setVelocity(renderable, { x, y })
+body.getVelocity(out?)                       // ⇔ adapter.getVelocity(renderable, out)
+body.applyForce(x, y)                        // ⇔ adapter.applyForce(renderable, { x, y })
+body.applyForce(x, y, pointX, pointY)        // off-centre force ⇒ generates torque (matter native)
+body.applyImpulse(x, y)                      // ⇔ adapter.applyImpulse(renderable, { x, y })
+
+// Angular kinematics
+body.setAngle(rad)                           // ⇔ adapter.setAngle(renderable, rad)
+body.getAngle()                              // ⇔ adapter.getAngle(renderable)
+body.setAngularVelocity(omega)               // ⇔ adapter.setAngularVelocity(renderable, omega)
+body.getAngularVelocity()                    // ⇔ adapter.getAngularVelocity(renderable)
+body.applyTorque(t)                          // ⇔ adapter.applyTorque(renderable, t)
+
+// Body state
+body.setSensor(isSensor?)                    // ⇔ adapter.setSensor(renderable, isSensor)
+body.setStatic(isStatic?)                    // ⇔ adapter.setStatic(renderable, isStatic)
+body.setMass(m)                              // wraps Matter.Body.setMass
+body.setBounce(r)                            // writes Matter.Body.restitution
+body.setGravityScale(s)                      // ⇔ adapter.setGravityScale(renderable, s)
+body.setCollisionMask(mask)                  // writes Matter.Body.collisionFilter.mask
+body.setCollisionType(type)                  // writes Matter.Body.collisionFilter.category
+```
+
+Pick whichever reads better at the call site — both forms are portable. The raw matter free functions (`Matter.Body.setVelocity(body, v)` etc.) are not stripped, so they remain available if you want to keep matter idioms verbatim.
+
+`adapter.applyImpulse()` accepts an application point, as the interface allows, but matter ignores it: the impulse always acts at the body's centre.
+
+### Reaching matter-native body fields
+
+The fields that matter exposes on its `Body` interface (`frictionAir`, `friction`, `restitution`, `angle`, `angularVelocity`, `torque`, `inertia`, …) are reachable directly on the body. Cast to the published `MatterAdapter.Body` type to keep type-checking happy without taking a direct `matter-js` import:
+
+```ts
+import { MatterAdapter } from "@melonjs/matter-adapter";
+
+// e.g. tune ball-felt drag based on speed (the pool-matter example uses this
+// for a sliding-vs-rolling friction split):
+(ball.body as MatterAdapter.Body).frictionAir = isSliding ? 0.018 : 0.003;
+
+// read matter-native angular velocity:
+const omega = (ball.body as MatterAdapter.Body).angularVelocity;
+```
+
+`MatterAdapter.Body` is `ReturnType<typeof Matter.Body.create> & PhysicsBody` — you get matter's full instance shape plus the portable helper methods, without needing to import `matter-js` yourself. Code that does this is matter-only by definition; for portable rotation use the angular kinematic methods above.
+
+## Raycasting
+
+```ts
+adapter.raycast(from: Vector2d, to: Vector2d) → RaycastHit | null
+```
+
+Shoot a ray through the world and get the first body hit:
+
+```ts
+const hit = adapter.raycast(new Vector2d(0, 0), new Vector2d(800, 600));
+if (hit) {
+    // hit.renderable — the renderable the ray entered
+    // hit.point      — world-space entry point on the body's surface
+    // hit.normal     — outward-facing surface normal at the entry
+    // hit.fraction   — 0..1 along the ray, from `from` to `to`
+}
+```
+
+Portable — same shape under the builtin SAT adapter, this one, and `@melonjs/planck-adapter`. Implementation walks each candidate body's vertices via per-edge segment intersection, so the reported `point` and `normal` reflect actual entry geometry rather than the body centre.
+
+> **Note on rotation:** `setAngle` / `setAngularVelocity` / `applyTorque` are now portable — they're declared on `PhysicsAdapter` and implemented by both this adapter and the builtin adapter. Under matter, rotation is fully solver-aware (the body's collision shape rotates and contact response reflects it); under builtin, rotation is visual-only (the SAT solver still tests axis-aligned shapes but the renderable's transform tracks the body's angle). Rotation is on by default (see `fixedRotation` below); code that needs bodies to stay axis-aligned opts out with `fixedRotation: true`, and can branch on `app.world.physic === "matter"` if it must. `frictionAir` damps rotation as well as translation, so it is also the knob that settles a spin.
+
+## Region queries
+
+```ts
+adapter.queryAABB(rect: Rect) → Renderable[]
+```
+
+Return every renderable whose body bounds overlap the given rectangle. Useful for area-of-effect damage, mouse / touch picking, trigger-zone sweeps, AI awareness checks. Portable — same call under builtin, matter, and planck. Under matter the implementation uses `Matter.Query.region` over the engine's body list.
+
+## Direct engine access
+
+For matter-specific features that don't fit the portable `PhysicsAdapter` surface — constraints, compound bodies, raw `Events`, plugins — the adapter exposes two escape hatches so you don't have to add `matter-js` as a direct dependency just to reach the factories:
+
+```ts
+const adapter = app.world.adapter as MatterAdapter;
+
+// The whole matter-js namespace. Modules are named exactly as in matter's docs
+// (Matter.Constraint, Matter.Composite, Matter.Bodies, Matter.Events, ...),
+// so brm.io/matter-js examples copy-paste without renaming.
+adapter.matter;          // typeof Matter
+adapter.matter.Constraint.create({ bodyA, bodyB, stiffness: 0.04 });
+
+// The Matter.Engine and its world (Matter.Composite that holds everything).
+adapter.engine;          // Matter.Engine
+adapter.engine.world;    // Matter.World — pass to Composite.add(...) / Composite.remove(...)
+```
+
+A complete spring constraint:
+
+```ts
+const spring = adapter.matter.Constraint.create({
+    bodyA: playerSprite.body as MatterAdapter.Body,
+    bodyB: anchorSprite.body as MatterAdapter.Body,
+    stiffness: 0.04,
+    length: 80,
+});
+adapter.matter.Composite.add(adapter.engine.world, spring);
+```
+
+Any code that touches `adapter.matter.*` or `adapter.engine.*` is matter-only — it will not run on the built-in adapter or any future adapter. Use the `PhysicsAdapter` methods (`setVelocity`, `applyForce`, `setStatic`, `setSensor`, `raycast`, …) for anything that should stay portable.
+
+## Recipes
+
+Concrete patterns for common gameplay needs. Each recipe is labelled **Portable** (same renderable code under any adapter), **Portable via velocity** (same code, just route through the body's velocity rather than the contact response), or **Matter-only** (uses a feature gated by `adapter.capabilities`).
+
+### Jump — instant upward impulse (Portable)
+
+`setVelocity` is the canonical "impulse" pattern on every adapter. Direct mutation of `vel.y` works under the builtin adapter but not under matter (matter's Verlet integrator needs both `velocity` and `positionPrev` reset together); the body method handles that for you.
+
+```ts
+const vel = this.body.getVelocity();
+this.body.setVelocity(vel.x, -JUMP_VEL);  // preserves horizontal motion
+```
+
+### Trigger zone / coin pickup (Portable)
+
+Mark the body as a sensor — collisions still fire `onCollisionStart` but the solver doesn't physically push the player away. `Collectable` and `Trigger` already declare `isSensor: true` in their default `bodyDef`.
+
+```ts
+class Coin extends Sprite {
+    constructor(x, y) {
+        super(x, y, { image: "coin" });
+        this.bodyDef = {
+            type: "static",
+            shapes: [new Ellipse(16, 16, 32, 32)],
+            isSensor: true,
+            collisionType: collision.types.COLLECTABLE_OBJECT,
+            collisionMask: collision.types.PLAYER_OBJECT,
+        };
+    }
+    onCollisionStart(_response, _other) {
+        gameState.score += 100;
+        this.ancestor.removeChild(this);
+    }
+}
+```
+
+### One-way platform (Portable)
+
+A sensor body + manual snap-to-top from the player. Falling players land; jumping players pass through; pressing _down_ drops through.
+
+```ts
+// Platform definition
+this.bodyDef = {
+    type: "static",
+    shapes: [new Rect(0, 0, width, height)],
+    isSensor: true,        // <-- key: matter doesn't try to resolve the contact
+    collisionType: collision.types.WORLD_SHAPE,
+    collisionMask: collision.types.PLAYER_OBJECT,
+};
+
+// Player handler — same on both adapters
+onCollisionActive(_response, other) {
+    if (other.type !== "platform") return;
+    if (input.keyStatus("down")) return;              // drop-through
+    const vel = this.body.getVelocity();
+    if (vel.y < 0) return;                            // jumping up — pass through
+    const playerBottom = this.pos.y + this.height;
+    const platformTop = other.pos.y;
+    if (playerBottom - platformTop > this.height * 0.5) return; // came from below
+    const adapter = this.parentApp.world.adapter;
+    adapter.setPosition(this, scratchPos.set(this.pos.x, platformTop - this.height));
+    this.body.setVelocity(vel.x, 0);
+}
+```
+
+The `platformer-matter` example takes another route: its platforms stay solid, and the player leaves a platform out of its `collisionMask` while it is below that platform or holding _down_.
+
+### Stomp detection (Portable via velocity)
+
+Read the body's **pre-contact velocity** in `onCollisionStart`. On both the builtin and the matter adapter, `onCollisionStart` runs before the contact is resolved, so the velocity is still the one at impact. A handler that ran earlier in the same step may have changed it, though: in the `platformer-matter` example the player's handler bounces the player before the enemy's handler reads it. `response.normal` is computed before any handler runs and cannot change, which is why that example uses it instead.
+
+```ts
+onCollisionStart(_response, other) {
+    if (other.body.collisionType !== collision.types.ENEMY_OBJECT) return;
+    const vel = this.body.getVelocity();
+    if (vel.y > 0) {
+        // I was falling at the moment of impact — stomp
+        other.die();
+        this.body.setVelocity(vel.x, -STOMP_BOUNCE);
+    } else {
+        this.hurt();
+    }
+}
+```
+
+If you do want adapter-native contact info (slope normals, penetration depth) you can branch on `adapter.name === "@melonjs/matter-adapter"` and reach `response.normal` / `response.depth` / `response.pair` — but that handler is no longer portable.
+
+### Spring / hinge between two bodies (Matter-only)
+
+Matter constraints are reached via the adapter's `matter` escape hatch — no need to add `matter-js` as a direct dependency.
+
+```ts
+const adapter = app.world.adapter as MatterAdapter;
+const spring = adapter.matter.Constraint.create({
+    bodyA: anchor.body as MatterAdapter.Body,
+    bodyB: player.body as MatterAdapter.Body,
+    stiffness: 0.04,    // 0 = floppy rope, 1 = rigid rod
+    length: 80,
+});
+adapter.matter.Composite.add(adapter.engine.world, spring);
+```
+
+Use `stiffness: 1` for a rigid hinge, low `stiffness` (~0.01–0.05) for spring-like behaviour. Set `pointA` / `pointB` to attach the constraint at a point offset from each body's centre.
+
+melonJS's shared joints, `app.world.addJoint()`, are not supported on matter: there it throws, and `capabilities.constraints` is `false`. They need `@melonjs/planck-adapter` or `@melonjs/rapier2d-adapter`; a game moving to matter with `world.setAdapter()` removes its joints first, or the switch throws once it is complete. A matter constraint like the one above is matter's own: the world does not keep it, so `world.setAdapter()` does not carry it over, and it is not removed with its bodies (remove it with `adapter.matter.Composite.remove()`).
+
+### Sleeping bodies (Matter-only)
+
+Matter can mark idle bodies as "sleeping" and skip integrating them entirely until disturbed — a meaningful CPU win when you have dozens of static-after-settling props (debris, fallen blocks, settled stacks). Enable at the engine level via the constructor, then leave matter to manage sleep state.
+
+```ts
+await MatterAdapter.create({
+    gravity: { x: 0, y: 5 },
+    matterEngineOptions: {
+        enableSleeping: true,
+    },
+});
+
+// Wake a specific body programmatically if needed (e.g. on a trigger event):
+const adapter = app.world.adapter as MatterAdapter;
+if (adapter.capabilities.sleepingBodies) {
+    adapter.matter.Sleeping.set(this.body as MatterAdapter.Body, false);
+}
+```
+
+A sleeping body ignores `setVelocity`, so a jump or a knockback given to it is lost. Wake it first with `Sleeping.set(body, false)` as above; `applyForce` wakes it on its own.
+
+The builtin adapter has no equivalent — there's no integration cost to skip, since SAT only runs collisions, not Verlet integration.
+
+## Body Definitions
+
+melonJS body definitions (`BodyDefinition`) are mapped to matter bodies. The keys you can set are the same as for the builtin adapter:
+
+```ts
+this.bodyDef = {
+    type: "dynamic" | "static",
+    shapes: BodyShape[],         // Rect, Polygon, RoundRect, Line (a 2px rectangle), Ellipse (a circle of the average radius)
+    collisionType?: number,      // defaults to PLAYER_OBJECT here, ENEMY_OBJECT on builtin
+    collisionMask?: number,
+    maxVelocity?: { x, y },
+    frictionAir?: number | { x, y },   // an { x, y } value is averaged; damps rotation as well as translation
+    friction?: number,           // surface friction during contact; the builtin adapter ignores it
+    restitution?: number,
+    density?: number,
+    gravityScale?: number,
+    isSensor?: boolean,
+    fixedRotation?: boolean,     // defaults to false, as matter does
+};
+```
+
+`type: "kinematic"` is accepted but simulated as `"dynamic"`, so the body falls under gravity, as on the builtin adapter. `Box3d`, `Sphere` and `Point` shapes throw: matter is 2D, and a point has no area. A shape's own `collisionType`, `collisionMask` and `isTrigger` are ignored, because matter filters whole bodies rather than their parts; `isActive: false` does keep a shape out of the simulation.
+
+### Collision filter API
+
+For matter users, the matter-native `body.collisionFilter.category` / `mask` is exposed as a live alias of the legacy `body.collisionType` / `collisionMask`:
+
+```ts
+// each pair of lines does the same thing; pick whichever convention you prefer:
+body.collisionFilter.category = collision.types.PLAYER_OBJECT;
+body.collisionType = collision.types.PLAYER_OBJECT;
+
+body.collisionFilter.mask = collision.types.ENEMY_OBJECT;
+body.collisionMask = collision.types.ENEMY_OBJECT;
+```
+
+## Behavioural notes when porting from the builtin adapter
+
+- **Rotation follows the engine.** `fixedRotation` defaults to `false`, as it does in matter itself, so a rigid body turns when something turns it. If your game code assumes axis-aligned bodies (it reads `pos` and expects an unrotated rect), pass `fixedRotation: true`. Before 1.4.0 this adapter locked rotation unless told otherwise, which inverted the engine it wraps.
+- **Polylines are simulated 2px thick.** matter has no segment shape, so each `Line` (Tiled emits one per polyline segment) becomes a thin rectangle along it. A fast body can pass through something that thin; see [TMX polylines](#tmx-polylines).
+- **`maxVelocity` is emulated.** matter has no native velocity cap; the adapter clamps each body's velocity in `afterUpdate`.
+- **Per-body `gravityScale` is emulated.** matter 0.20 only honors the engine-level `gravity.scale`; the adapter applies a counter-force in `beforeUpdate` for bodies that opt out.
+- **`isGrounded` needs a contact that pushes the body up.** A floor or a slope counts, the side of a wall does not. A contact with a sensor counts when the sensor's centre is below the body's. Inside an `onCollisionStart` handler for a stomp, the enemy you just landed on already counts as ground, so don't use `!isGrounded` as a proxy for "I was airborne before this contact."
+- **A body without `collisionType` is a `PLAYER_OBJECT`.** That is matter's default category, `0x0001`. The builtin adapter defaults to `ENEMY_OBJECT`, so set `collisionType` on every body that a handler or a mask checks.
+- **Pausing stops the whole simulation.** Under `state.pause()` matter does not step at all. On the builtin adapter a renderable with `updateWhenPaused` keeps moving; here it does not.
+- **`updateShape` rebuilds the body from its `bodyDef`.** Velocity and angular velocity carry over. The angle, and anything changed since with `setSensor`, `setCollisionType`, `setCollisionMask`, `setStatic`, `setFrictionAir`, `setMaxVelocity`, `setGravityScale` or `setMass`, do not. `renderable.body` is also a new object, so a constraint on the old one stops working. Call those setters after `updateShape`.
+
+## Porting from the built-in adapter
+
+The `PhysicsAdapter` interface is the portable surface. If your gameplay code only uses methods on `world.adapter` (and the collision hooks on `Renderable`), most of it ports without changes. The pitfalls below cover the parts that don't.
+
+> **Coming from a pre-19.5 codebase?** If your game still uses the legacy `new me.Body(this, shape)` pattern and the `onCollision(response, other)` handler, start with the wiki's [Migrating to the Physics Adapter API](https://github.com/melonjs/melonJS/wiki/Migrating-to-the-Physics-Adapter-API) guide — it covers the legacy → declarative `bodyDef` + lifecycle-handler migration on the built-in adapter. The notes below pick up after that, for the actual built-in → matter swap. See also [Switching Physics Adapters](https://github.com/melonjs/melonJS/wiki/Switching-Physics-Adapters) and [BuiltinAdapter Quirks](https://github.com/melonjs/melonJS/wiki/BuiltinAdapter-Quirks) for engine-portability gotchas.
+
+### `isGrounded` is literal, not predictive
+
+It returns `true` while the body has an active contact that pushes it up: a floor or a slope, not the side of a wall. A contact with a sensor counts when the sensor's centre is below the body's. Inside an `onCollisionStart` for a stomp, the enemy you just landed on already counts as ground, so `!isGrounded` is **not** a reliable "I was airborne before this contact" check. Use the body's pre-contact **velocity** instead (`vel.y > 0` = falling at impact).
+
+### Matter forces are *much* smaller than builtin forces
+
+`applyForce` on matter integrates as `force / mass * dt²`. With a typical 64×96 sprite (mass ≈ 6) and `dt ≈ 16`, a force of `0.05` already moves the body noticeably. If you ported a builtin `WALK_FORCE = 0.4` directly, the player rockets across the screen. Start ~100× smaller and tune up.
+
+### `applyForce` is not a one-shot impulse
+
+It's a sustained Newtonian force, reset at the end of each step. The single-step contribution depends on `dt` and mass, so it's a fragile way to do "instant velocity change" — for jumps, dashes, knockbacks, use `setVelocity` (immediate) or `applyImpulse`.
+
+### Sensor bodies disable physical resolution
+
+To make a body non-solid (one-way platform, trigger zone, ground-snap assist), mark it as a sensor:
+
+```ts
+adapter.setSensor(platform, true);
+// or declaratively on the body def:
+bodyDef.isSensor = true;
+```
+
+A sensor still fires `onCollisionStart` / `onCollisionActive` / `onCollisionEnd` — only the physical separation is disabled.
+
+### Slopes need to be authored as proper ramps OR use snap-to-surface
+
+The builtin adapter's slope handling pattern (mutating `response.overlapV.y` to force the player up regardless of contact angle) doesn't translate — matter resolves contacts based on actual geometry. If your TMX has a slope polygon with a vertical "approach wall," matter will block the player. Two ways out:
+
+1. Author the slope as a 3-vertex triangle (no approach wall).
+2. Make the slope a sensor and handle the contact in `onCollisionActive`: clear a downward velocity first, then move the player up by the penetration depth with `adapter.setPosition(player, new Vector2d(player.pos.x, player.pos.y - response.depth))`. The `platformer-matter` example uses this pattern.
+
+### One-way platforms
+
+A sensor body + manual landing snap. Falling players land; jumping players pass through; pressing _down_ drops through:
+
+```ts
+// at load time
+adapter.setSensor(platform, true);
+
+// in player.onCollisionActive(_response, other):
+if (other.type === "platform") {
+    if (input.keyStatus("down")) return;           // drop through
+    const vel = adapter.getVelocity(this);
+    if (vel.y < 0) return;                          // jumping up
+    const playerBottom = this.pos.y + this.height;
+    if (playerBottom > other.pos.y + 16) return;    // too deep — came from below
+    adapter.setPosition(this, new Vector2d(this.pos.x, other.pos.y - this.height));
+    adapter.setVelocity(this, new Vector2d(vel.x, 0));
+}
+```
+
+### TMX polylines
+
+Tiled emits one `Line` per polyline segment, and each is simulated as a 2px thick rectangle along it. A fast body can pass through something that thin. If one does, raise `subSteps`, or rebuild a horizontal polyline thicker at load time: `adapter.updateShape(obj, [new Rect(0, 0, width, 6)])`.
+
+### `body.position` vs `renderable.pos`
+
+matter's `body.position` is the **centroid**; `renderable.pos` is **top-left** (with anchor 0,0). The adapter keeps the two in sync via a stored offset — your gameplay code should read `renderable.pos` for visual placement; only reach for `body.position` for matter-internal needs.
+
+Writing `renderable.pos` does not move the body: the adapter copies the body's position back over `pos` after every step. Move a body with `adapter.setPosition(renderable, p)` instead.
+
+### A simple porting example
+
+A minimal player entity. The same class on the built-in adapter, then ported here. Numbered comments call out what changed and why.
+
+**Before — built-in (SAT) adapter:**
+
+```ts
+import { Application, collision, input, Rect, Sprite, video } from "melonjs";
+
+const app = new Application(800, 600, {
+    parent: "screen",
+    renderer: video.AUTO,
+    // physic: defaults to BuiltinAdapter
+});
+
+// mandatory since melonJS 20.0: the renderer is built here
+await app.init();
+
+const MAX_VEL_X = 3;
+const MAX_VEL_Y = 15;
+
+class Player extends Sprite {
+    constructor(x: number, y: number) {
+        super(x, y, { image: "player", framewidth: 64, frameheight: 96 });
+
+        this.bodyDef = {
+            type: "dynamic",
+            shapes: [new Rect(0, 0, 64, 96)],
+            collisionType: collision.types.PLAYER_OBJECT,
+            maxVelocity: { x: MAX_VEL_X, y: MAX_VEL_Y },
+            frictionAir: { x: 0.4, y: 0 },
+        };
+
+        input.bindKey(input.KEY.LEFT,  "left");
+        input.bindKey(input.KEY.RIGHT, "right");
+        input.bindKey(input.KEY.UP,    "jump", true);
+    }
+
+    update(dt: number) {
+        const adapter = this.parentApp.world.adapter;
+        const vel = adapter.getVelocity(this);
+
+        if (input.isKeyPressed("left")) {
+            adapter.applyForce(this, { x: -MAX_VEL_X, y: 0 });
+        } else if (input.isKeyPressed("right")) {
+            adapter.applyForce(this, { x:  MAX_VEL_X, y: 0 });
+        }
+        if (input.isKeyPressed("jump")) {
+            adapter.setVelocity(this, { x: vel.x, y: -MAX_VEL_Y });
+        }
+
+        return super.update(dt);
+    }
+
+    onCollisionStart(response, other) {
+        if (other.body.collisionType !== collision.types.ENEMY_OBJECT) return;
+        const adapter = this.parentApp.world.adapter;
+        if (response.normal.y < -0.7) {
+            // I'm on top of the enemy — stomp
+            const vel = adapter.getVelocity(this);
+            adapter.setVelocity(this, { x: vel.x, y: -MAX_VEL_Y * 0.75 });
+            return;
+        }
+        this.hurt();
+    }
+}
+```
+
+**After — `@melonjs/matter-adapter`:**
+
+```ts
+import { Application, collision, input, Rect, Sprite, video } from "melonjs";
+import { MatterAdapter } from "@melonjs/matter-adapter";
+
+const app = new Application(800, 600, {
+    parent: "screen",
+    renderer: video.AUTO,
+    // (1) Swap the adapter. Pick a gravity that suits your sprite scale.
+    physic: await MatterAdapter.create({ gravity: { x: 0, y: 5 } }),
+});
+
+// mandatory since melonJS 20.0: the renderer is built here
+await app.init();
+
+const MAX_VEL_X = 3;
+const MAX_VEL_Y = 15;
+// (2) Matter forces are Newtonian (force/mass*dt²) — magnitudes ~100× smaller.
+const WALK_FORCE = 0.012;
+
+class Player extends Sprite {
+    constructor(x: number, y: number) {
+        super(x, y, { image: "player", framewidth: 64, frameheight: 96 });
+
+        // bodyDef is portable — shape, collision type, maxVelocity unchanged.
+        // (3) frictionAir is scalar in matter (no per-axis variant).
+        this.bodyDef = {
+            type: "dynamic",
+            shapes: [new Rect(0, 0, 64, 96)],
+            collisionType: collision.types.PLAYER_OBJECT,
+            maxVelocity: { x: MAX_VEL_X, y: MAX_VEL_Y },
+            frictionAir: 0.02,
+        };
+
+        input.bindKey(input.KEY.LEFT,  "left");
+        input.bindKey(input.KEY.RIGHT, "right");
+        input.bindKey(input.KEY.UP,    "jump", true);
+    }
+
+    update(dt: number) {
+        const adapter = this.parentApp.world.adapter;
+        const vel = adapter.getVelocity(this);
+
+        // (4) Same applyForce calls — only the magnitude changed.
+        if (input.isKeyPressed("left")) {
+            adapter.applyForce(this, { x: -WALK_FORCE, y: 0 });
+        } else if (input.isKeyPressed("right")) {
+            adapter.applyForce(this, { x:  WALK_FORCE, y: 0 });
+        }
+        // (5) setVelocity is portable — works the same way on both adapters.
+        if (input.isKeyPressed("jump")) {
+            adapter.setVelocity(this, { x: vel.x, y: -MAX_VEL_Y });
+        }
+
+        return super.update(dt);
+    }
+
+    // (6) Stomp logic is unchanged — `response.normal` and `onCollisionStart`
+    //     are part of the portable API and behave identically on both adapters.
+    onCollisionStart(response, other) {
+        if (other.body.collisionType !== collision.types.ENEMY_OBJECT) return;
+        if (response.normal.y < -0.7) {
+            const adapter = this.parentApp.world.adapter;
+            const vel = adapter.getVelocity(this);
+            adapter.setVelocity(this, { x: vel.x, y: -MAX_VEL_Y * 0.75 });
+            return;
+        }
+        this.hurt();
+    }
+}
+```
+
+**Summary of changes:**
+
+| # | Change | Reason |
+|---|---|---|
+| 1 | Pass `MatterAdapter` to `physic` | switching engines |
+| 2 | `WALK_FORCE = 0.012` (down from `3`) | Newtonian magnitudes are much smaller |
+| 3 | `frictionAir: 0.02` (scalar) | matter has no per-axis air friction |
+| 4 | `applyForce` calls unchanged | portable API |
+| 5 | `setVelocity` for jump unchanged | portable; correct pattern for instant velocity change |
+| 6 | `onCollisionStart` + `response.normal` unchanged | portable lifecycle handler with identical contract on both adapters |
+
+`bodyDef` shape, collision masks, max-velocity cap, key bindings, sprite setup, collision handler — all unchanged.
+
+### Default behaviour differences vs builtin
+
+| Behaviour | Builtin | Matter |
+|---|---|---|
+| `fixedRotation` default | n/a (SAT bodies don't rotate) | `false` — matches matter. Set `true` for bodies that must stay upright |
+| Continuous collision detection | ❌ | ❌ (raise `subSteps` for fast bodies) |
+| Sleeping bodies | ❌ | ✅ |
+| Joints through `world.addJoint()` | ❌ (throws) | ❌ (throws); use planck or Rapier |
+| Constraints (springs, hinges) | ❌ | ✅ via `Matter.Constraint` (reach via `adapter.matter`) |
+| `applyForce` units | px/frame² | matter Newtonian |
+| Default `collisionType` | `ENEMY_OBJECT` | `PLAYER_OBJECT` (matter's category `0x0001`) |
+| `updateWhenPaused` under `state.pause()` | the renderable keeps moving | ignored: the whole simulation stops |
+
+## Porting checklist
+
+1. Verify the console shows `@melonjs/matter-adapter <version> | <url>` and `physics: matter`
+2. Set a reasonable `gravity` (e.g. `{ x: 0, y: 4 }` for arcade platformers)
+3. Divide your existing `applyForce` magnitudes by ~30–100 as a starting point
+4. Use `response.normal.y < -0.7` for stomp checks instead of `!isGrounded` (matter-native MTV; portable to builtin too)
+5. Mark trigger / one-way / pickup bodies as `isSensor: true` to disable physical resolution while still firing the lifecycle handlers
+6. Replace slope-response hacks with snap-to-surface in `onCollisionActive`
+7. Thicken TMX polylines with `updateShape`, or raise `subSteps`, if fast bodies pass through them (each segment is simulated 2px thick)
+8. Pass `fixedRotation: true` in `bodyDef` for anything that must stay axis-aligned; bodies rotate by default, as they do in matter
+9. Set `collisionType` on every body a handler or a mask checks (matter's default is `PLAYER_OBJECT`)
+10. Move bodies with `adapter.setPosition()`, not by writing `renderable.pos`
+
+## Examples
+
+The melonJS repo's `platformer-matter` example is a full port of the canonical platformer running on this adapter, including:
+
+- Matter-native player movement (`applyForce` for walking, `setVelocity` for the jump)
+- Stomp detection from `response.normal`
+- Slope grip in `onCollisionActive`, with the slopes made sensors
+- One-way platforms that stay solid: each has its own collision bit, and the player leaves that bit out of its `collisionMask` while it is below the platform or holding _down_
+- The adapter's own line and `physics: matter` in the console, showing it was loaded
+
+## License
+
+[MIT](https://github.com/melonjs/melonJS/blob/master/LICENSE)
